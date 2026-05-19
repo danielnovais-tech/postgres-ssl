@@ -332,6 +332,19 @@ emit_wal_heartbeat() {
     >/dev/null 2>&1 || true
 }
 
+# If PITR is enabled but this cluster has never archived a WAL segment, force
+# an immediate segment boundary from inside the image. This removes the "idle
+# new DB never recorded WAL" footgun without relying on the external monitor:
+# a correctly-wired archive_command archives the switched segment, while a
+# broken setup fails loudly through pg_stat_archiver / Postgres logs and the
+# watcher keeps retrying.
+force_initial_wal_archive() {
+  [ "${ARCHIVED_COUNT:-0}" -ne 0 ] && return 0
+  psql -U postgres -tAXq -c "SELECT pg_switch_wal()" >/dev/null 2>&1 \
+    && log "forced initial WAL switch (archived_count=0)" \
+    || log "initial WAL switch failed (non-fatal)"
+}
+
 watcher_iteration() {
   if ! pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; then
     log "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
@@ -348,6 +361,8 @@ watcher_iteration() {
     log "iteration skipped: pg_stat_archiver query failed (transient psql error)"
     return 0
   fi
+
+  force_initial_wal_archive
 
   decide_action
   if [ -z "$DECIDED_ACTION" ]; then
