@@ -1733,6 +1733,123 @@ t_watcher_gap_recovery_failed_count_path() {
   docker volume rm "$vol" >/dev/null
 }
 
+# LSN-lag detection path — async-side queue-max-trip silently drops
+# segments while the foreground archive-push returns 0 to Postgres, so
+# neither the wrapper-side pg_wal threshold nor pg_stat_archiver.failed_count
+# fires. The watcher's LSN-lag probe is the only line of defense. This test
+# asserts the probe (a) detects the divergence and logs it, (b) writes
+# .pgbackrest_gap_pending, (c) records last_lag_detected_at in state — all
+# while failed_count stays at 0.
+#
+# Reuses the queue-max-trip recipe from t_queue_max_5gib_trips: small spool
+# (128 MiB) + read-only S3 creds + fast WAL pumping. The async worker can't
+# PUT, the spool fills past queue-max, pgBackRest's foreground drops new
+# segments with "dropped WAL file ... archive queue exceeded" + returns 0.
+# That return-0 keeps the wrapper-side drop dormant (also helped by a high
+# WAL_DROP_THRESHOLD_MB), and keeps failed_count flat. Only the LSN-lag
+# comparison (handoff WAL vs S3 catalog max) catches it.
+t_watcher_gap_recovery_lsn_lag_path() {
+  local name=t-gap-lag-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Phase 1: boot with writable creds + standard config to land an initial
+  # full backup and seed the S3 catalog. The lag probe needs a real "max"
+  # to compare against — without an initial full + WAL push, the probe
+  # short-circuits via the "no matching timeline in catalog" branch.
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_watcher_gap_recovery_lsn_lag_path "init boot"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_lsn_lag_path "no initial full"; fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"; return; }
+  docker rm -f "$name" >/dev/null
+
+  # Phase 2: restart with read-only creds, small queue-max, high
+  # wrapper-drop threshold, and aggressively-shortened watcher cadences so
+  # the lag probe trips within the test window. WAL_LAG_GAP_THRESHOLD_SEGMENTS=4
+  # is well below the ~8 segments / 128 MiB queue-max drop point so the
+  # threshold fires as soon as the first queue-max drops happen.
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_ARCHIVE_BUCKET=$BUCKET" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e WAL_ARCHIVE_KEY=readonly \
+    -e WAL_ARCHIVE_SECRET=readonlypass123 \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX=128MiB \
+    -e WAL_DROP_THRESHOLD_MB=999999 \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 \
+    -e WAL_LAG_PROBE_INTERVAL_SECONDS=5 \
+    -e WAL_LAG_GAP_THRESHOLD_SEGMENTS=4 \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_watcher_gap_recovery_lsn_lag_path "ro boot"; fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"; return; }
+
+  # Pump ~960 MiB of WAL with read-only creds → spool overflows the 128 MiB
+  # queue-max → pgBackRest's foreground starts dropping new segments.
+  docker exec "$name" psql -U postgres -c "ALTER TABLE t ADD COLUMN IF NOT EXISTS payload text;" >/dev/null 2>&1
+  for i in $(seq 1 12); do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series($((i*80000)), $(((i+1)*80000))) g; SELECT pg_switch_wal();" >/dev/null 2>&1
+  done
+
+  # Wait for the LSN-lag probe to fire. WAL_LAG_PROBE_INTERVAL_SECONDS=5
+  # and POLL_INTERVAL_SECONDS=5 → detection within ~10s of the first drop.
+  local deadline=$(($(date +%s) + 90)) detected=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "LSN-lag gap detected"; then detected=1; break; fi
+    sleep 2
+  done
+  if [ "$detected" != "1" ]; then
+    ko t_watcher_gap_recovery_lsn_lag_path "watcher did not detect LSN lag within deadline"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  # Assert (a): failed_count is still 0. If it grew, this test isn't
+  # exclusively exercising the LSN-lag path (the failed_count branch would
+  # have caught the gap independently).
+  local failed_count
+  failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+  if [ "${failed_count:-0}" -ne 0 ]; then
+    ko t_watcher_gap_recovery_lsn_lag_path "expected failed_count=0 (proves LSN-lag-only path); got $failed_count"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  # Assert (b): gap marker file present, written by the LSN-lag probe (not
+  # by the wrapper-side path, which is gated by the high WAL_DROP_THRESHOLD_MB).
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_watcher_gap_recovery_lsn_lag_path ".pgbackrest_gap_pending was not written by the LSN-lag probe"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  # Assert (c): last_lag_detected_at recorded in the watcher state file so
+  # gap_recovered honours the LSN-lag grace window. Without it, the next
+  # iteration would clear the marker on a successful full and any
+  # immediately-re-detected lag would re-mark in a tight loop.
+  local last_lag_at
+  last_lag_at=$(docker exec "$name" grep -E "^last_lag_detected_at=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
+  if [ -z "$last_lag_at" ] || [ "$last_lag_at" = "0" ]; then
+    ko t_watcher_gap_recovery_lsn_lag_path "last_lag_detected_at not written to state (got '$last_lag_at')"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  ok t_watcher_gap_recovery_lsn_lag_path
+  note "LSN-lag detected with failed_count=0; marker written; last_lag_detected_at=${last_lag_at}"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # G2. PITR target older than oldest-retained full → wrapper exits 1 with a
 # clear "no matching backup set" error. Image-level defense-in-depth for the
 # mono mutation's pre-validation, which can be stale by the time the
@@ -3006,6 +3123,7 @@ ALL_TESTS=(
   t_empty_volume_restore_from_s3
   t_retention_expires_old_fulls
   t_watcher_gap_recovery_failed_count_path
+  t_watcher_gap_recovery_lsn_lag_path
   t_pitr_target_before_retention_window_refuses
   t_retention_expire_cascades_to_wal
   t_empty_volume_restore_refuses_on_bad_creds
