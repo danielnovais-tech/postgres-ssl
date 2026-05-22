@@ -1733,21 +1733,22 @@ t_watcher_gap_recovery_failed_count_path() {
   docker volume rm "$vol" >/dev/null
 }
 
-# LSN-lag detection path — async-side queue-max-trip silently drops
-# segments while the foreground archive-push returns 0 to Postgres, so
-# neither the wrapper-side pg_wal threshold nor pg_stat_archiver.failed_count
-# fires. The watcher's LSN-lag probe is the only line of defense. This test
-# asserts the probe (a) detects the divergence and logs it, (b) writes
-# .pgbackrest_gap_pending, (c) records last_lag_detected_at in state — all
-# while failed_count stays at 0.
+# LSN-lag detection path — pgBackRest async mode returns archive_command
+# success to Postgres the moment the WAL lands in the spool, BEFORE the
+# upload to S3 is confirmed. With a small queue-max + a failing async
+# worker, segments accumulate in spool, queue-max trips, and pgBackRest's
+# foreground drops new segments while returning 0 to Postgres. Some pushes
+# still surface as failures (foreground catches a prior async error and
+# returns non-zero), so in practice failed_count and archived_count BOTH
+# grow under load — but only the LSN-lag comparison catches the silent
+# half (the drops, which contribute to handoff WAL advancing without the
+# repo catalog moving).
 #
-# Reuses the queue-max-trip recipe from t_queue_max_5gib_trips: small spool
-# (128 MiB) + read-only S3 creds + fast WAL pumping. The async worker can't
-# PUT, the spool fills past queue-max, pgBackRest's foreground drops new
-# segments with "dropped WAL file ... archive queue exceeded" + returns 0.
-# That return-0 keeps the wrapper-side drop dormant (also helped by a high
-# WAL_DROP_THRESHOLD_MB), and keeps failed_count flat. Only the LSN-lag
-# comparison (handoff WAL vs S3 catalog max) catches it.
+# The unique-to-LSN-lag fingerprint is `last_lag_detected_at` in the
+# watcher state file — only `check_lsn_lag_and_mark_gap` writes it. This
+# test asserts the probe fired by checking that field, plus the absence
+# of wrapper-side drop log lines (which would mean the wrapper, not the
+# probe, wrote the marker).
 t_watcher_gap_recovery_lsn_lag_path() {
   local name=t-gap-lag-${PG_VERSION}
   local vol=${name}-vol
@@ -1771,9 +1772,7 @@ t_watcher_gap_recovery_lsn_lag_path() {
 
   # Phase 2: restart with read-only creds, small queue-max, high
   # wrapper-drop threshold, and aggressively-shortened watcher cadences so
-  # the lag probe trips within the test window. WAL_LAG_GAP_THRESHOLD_SEGMENTS=4
-  # is well below the ~8 segments / 128 MiB queue-max drop point so the
-  # threshold fires as soon as the first queue-max drops happen.
+  # the lag probe trips within the test window.
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
     -e POSTGRES_PASSWORD=test \
     -e "WAL_ARCHIVE_BUCKET=$BUCKET" \
@@ -1800,52 +1799,64 @@ t_watcher_gap_recovery_lsn_lag_path() {
     docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series($((i*80000)), $(((i+1)*80000))) g; SELECT pg_switch_wal();" >/dev/null 2>&1
   done
 
-  # Wait for the LSN-lag probe to fire. WAL_LAG_PROBE_INTERVAL_SECONDS=5
-  # and POLL_INTERVAL_SECONDS=5 → detection within ~10s of the first drop.
-  local deadline=$(($(date +%s) + 90)) detected=0
+  # Wait for the probe to write the gap marker. WAL_LAG_PROBE_INTERVAL_SECONDS=5
+  # and POLL_INTERVAL_SECONDS=5 → detection within ~10-15s of the first drop.
+  # Poll on the marker FILE rather than a specific log line because docker
+  # log timing through high-volume pgbackrest output can race a one-shot
+  # "gap detected" line; the marker + state file are durable evidence.
+  local deadline=$(($(date +%s) + 90)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "LSN-lag gap detected"; then detected=1; break; fi
+    if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending 2>/dev/null; then
+      hit=1; break
+    fi
     sleep 2
   done
-  if [ "$detected" != "1" ]; then
-    ko t_watcher_gap_recovery_lsn_lag_path "watcher did not detect LSN lag within deadline"
+  if [ "$hit" != "1" ]; then
+    ko t_watcher_gap_recovery_lsn_lag_path "gap marker not written within deadline"
     fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
     return
   fi
 
-  # Assert (a): failed_count is still 0. If it grew, this test isn't
-  # exclusively exercising the LSN-lag path (the failed_count branch would
-  # have caught the gap independently).
-  local failed_count
-  failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
-  if [ "${failed_count:-0}" -ne 0 ]; then
-    ko t_watcher_gap_recovery_lsn_lag_path "expected failed_count=0 (proves LSN-lag-only path); got $failed_count"
-    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
-    return
-  fi
+  # Wait one more poll for write_state_field to land last_lag_detected_at
+  # (touch happens immediately before the state write — usually same shell
+  # tick, but tolerate a few seconds of fs flush lag).
+  sleep 3
 
-  # Assert (b): gap marker file present, written by the LSN-lag probe (not
-  # by the wrapper-side path, which is gated by the high WAL_DROP_THRESHOLD_MB).
-  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
-    ko t_watcher_gap_recovery_lsn_lag_path ".pgbackrest_gap_pending was not written by the LSN-lag probe"
-    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
-    return
-  fi
-
-  # Assert (c): last_lag_detected_at recorded in the watcher state file so
-  # gap_recovered honours the LSN-lag grace window. Without it, the next
-  # iteration would clear the marker on a successful full and any
-  # immediately-re-detected lag would re-mark in a tight loop.
+  # Assert (a): last_lag_detected_at recorded in the watcher state file.
+  # Only check_lsn_lag_and_mark_gap writes this field — it's the unique
+  # fingerprint that the LSN-lag probe fired (vs. the failed_count branch
+  # or the wrapper-side drop, neither of which touches this key).
   local last_lag_at
   last_lag_at=$(docker exec "$name" grep -E "^last_lag_detected_at=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
   if [ -z "$last_lag_at" ] || [ "$last_lag_at" = "0" ]; then
-    ko t_watcher_gap_recovery_lsn_lag_path "last_lag_detected_at not written to state (got '$last_lag_at')"
+    ko t_watcher_gap_recovery_lsn_lag_path "last_lag_detected_at not written to state (got '$last_lag_at') — LSN-lag probe did not fire"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  # Assert (b): the wrapper-side drop path did NOT fire. The wrapper logs a
+  # distinct prefix ("pgbackrest-wrapper:") when it touches the marker on
+  # NoSuchBucket / InvalidAccessKeyId / pg_wal-threshold paths. With
+  # WAL_DROP_THRESHOLD_MB=999999 and 403 AccessDenied (which doesn't match
+  # the bucket-gone grep), the wrapper has no reason to touch the marker.
+  # If it did, the LSN-lag attribution is bogus.
+  if docker logs "$name" 2>&1 | grep -qE "pgbackrest-wrapper:.*(dropping|bucket gone or credentials revoked)"; then
+    ko t_watcher_gap_recovery_lsn_lag_path "wrapper-side drop fired; cannot attribute marker to LSN-lag probe"
+    fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
+    return
+  fi
+
+  # Assert (c): probe-emitted log line is present (in either form). Gives
+  # an extra observable signal beyond the state file and helps with
+  # post-mortem grepping.
+  if ! docker logs "$name" 2>&1 | grep -qE "pgbackrest-watcher: LSN-lag (gap detected|persists)"; then
+    ko t_watcher_gap_recovery_lsn_lag_path "expected 'pgbackrest-watcher: LSN-lag …' log line not present"
     fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
     return
   fi
 
   ok t_watcher_gap_recovery_lsn_lag_path
-  note "LSN-lag detected with failed_count=0; marker written; last_lag_detected_at=${last_lag_at}"
+  note "LSN-lag probe wrote marker + last_lag_detected_at=${last_lag_at}; wrapper-side drop did not fire"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
