@@ -2520,6 +2520,17 @@ t_restored_marker_persists_across_restarts() {
     fail_dump t_restored_marker_persists_across_restarts "$rest_name"
     return
   fi
+  # /etc/pgbackrest/pgbackrest-recovery-source.conf carries the source
+  # bucket's read credentials. Post-promote, archive_command uses the main
+  # /etc/pgbackrest/pgbackrest.conf — the recovery-source conf is unused.
+  # With .pgbackrest_restored present, configure_pgbackrest_recovery must
+  # NOT rewrite it on every boot; otherwise we leak source creds onto
+  # disk on every restart for no functional benefit.
+  if docker exec "$rest_name" test -f /etc/pgbackrest/pgbackrest-recovery-source.conf; then
+    ko t_restored_marker_persists_across_restarts "pgbackrest-recovery-source.conf rewritten post-promote (marker not gating)"
+    fail_dump t_restored_marker_persists_across_restarts "$rest_name"
+    return
+  fi
 
   ok t_restored_marker_persists_across_restarts
   note ".pgbackrest_restored survived restart; configure_pgbackrest_recovery deferred"
@@ -3098,6 +3109,229 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
+# H1. Graceful shutdown propagates SIGTERM through wrapper.sh → docker-
+# entrypoint.sh → postgres so postmaster runs its cleanup (removes
+# postmaster.pid, flushes CHECKPOINT). Without the `exec` prefix on the
+# last line of wrapper.sh, wrapper.sh stays as PID 1, bash doesn't forward
+# SIGTERM, and postgres is SIGKILL'd at the docker-stop grace boundary,
+# leaving stale postmaster.pid that the next boot can collide with via
+# its in-container kill(stale_pid, 0) liveness check.
+#
+# Test: boot, take initial full, `docker stop` (graceful SIGTERM with 30s
+# grace), then `docker start` on the same volume; assert no "lock file
+# postmaster.pid already exists" FATAL on the second boot.
+t_graceful_shutdown_preserves_postmaster_pid_cleanup() {
+  local name=t-graceful-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase1 startup"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase1 initial full"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
+
+  # Graceful stop with a generous grace window — postgres' shutdown
+  # sequence on a quiet DB usually completes in <2s, but allow headroom
+  # for slow-host CI variance.
+  docker stop -t 30 "$name" >/dev/null
+
+  # Inspect for SIGKILL fingerprint. State.OOMKilled=false + ExitCode
+  # within the SIGTERM family confirms graceful exit. Exit 0 (postgres
+  # received SIGTERM and handled it) is the happy case.
+  local exit_code oom
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null)
+  oom=$(docker inspect -f '{{.State.OOMKilled}}' "$name" 2>/dev/null)
+  if [ "$oom" = "true" ]; then
+    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "container OOM-killed during graceful stop"
+    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
+    return
+  fi
+  # 137 = 128+9 (SIGKILL — docker stop grace expired). Anything else
+  # (0, 130=SIGINT, 143=SIGTERM) means postmaster got to handle the
+  # signal. Without H1's `exec`, wrapper.sh stays PID 1 and exits 143
+  # while postgres is reaped via SIGKILL — postgres logs FATAL exit and
+  # postmaster.pid stays on disk.
+  if [ "$exit_code" = "137" ]; then
+    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "container SIGKILL'd at grace boundary (exit 137) — postgres did not shutdown gracefully"
+    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
+    return
+  fi
+
+  # Restart on the same volume. Container is removed first so the new
+  # PID namespace is fresh — same shape as a redeploy.
+  docker rm -f "$name" >/dev/null
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase2 startup"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
+
+  # The smoking-gun log for the stale-pid scenario:
+  if docker logs "$name" 2>&1 | grep -qE 'lock file "postmaster.pid" already exists'; then
+    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "stale postmaster.pid blocked phase2 boot — graceful shutdown didn't clean up"
+    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
+    return
+  fi
+
+  ok t_graceful_shutdown_preserves_postmaster_pid_cleanup
+  note "docker stop sent SIGTERM, postgres exited cleanly, phase2 boot found a clean PGDATA"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# M1. Gap-recovery in progress must suppress periodic-full AND catalog-
+# verify-driven full. Asserts that with the gap marker present, an
+# overdue catalog-verify cycle (interval=5s) doesn't fire a full backup
+# — gap-recovery owns the marker, decide_action stays silent. Without
+# the ordering fix, a verify mid-recovery could see backup.info just
+# rotated by retention and force a full through a wedged S3.
+t_gap_marker_suppresses_catalog_verify_full() {
+  local name=t-gap-verify-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5
+  wait_for_pg "$name" || { ko t_gap_marker_suppresses_catalog_verify_full "startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_gap_marker_suppresses_catalog_verify_full "no initial full"; fail_dump t_gap_marker_suppresses_catalog_verify_full "$name"; return; }
+
+  # Inject the gap marker, then nuke the catalog metadata (simulating a
+  # transient S3 hiccup that reports "no full present" mid-recovery).
+  docker exec -u postgres "$name" touch /var/lib/postgresql/data/.pgbackrest_gap_pending
+  local before_full_count
+  before_full_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+
+  # Wait long enough for several catalog-verify cycles (interval=5s) +
+  # several watcher iterations (POLL=5s) to elapse. ~20s is 4 cycles.
+  sleep 20
+
+  # Critical assertion: no NEW fulls. The marker must have suppressed
+  # both the catalog-verify-clear-state path AND the periodic-full path.
+  local after_full_count
+  after_full_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+  if [ "$after_full_count" -gt "$before_full_count" ]; then
+    ko t_gap_marker_suppresses_catalog_verify_full "watcher took an extra full while gap marker present (before=$before_full_count after=$after_full_count)"
+    fail_dump t_gap_marker_suppresses_catalog_verify_full "$name"
+    return
+  fi
+  # And the marker is still in place (we never let recovery complete).
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_gap_marker_suppresses_catalog_verify_full "gap marker cleared without recovery; test premise broken"
+    return
+  fi
+
+  ok t_gap_marker_suppresses_catalog_verify_full
+  note "gap marker held for ~20s through catalog-verify cycles; no extra full taken"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# L4. .pgbackrest_stanza_create_timeout sentinel is cleared once
+# stanza-create eventually succeeds. The timeout path itself (postgres
+# never reaches pg_isready in 600s) is hard to trigger reliably in CI,
+# so this test exercises the inverse: manually drop a stale sentinel
+# from a previous boot's timeout, boot normally, assert the sentinel is
+# cleared after the success path runs.
+t_stanza_create_timeout_sentinel_cleared_on_success() {
+  local name=t-stanza-sentinel-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Pre-seed the sentinel into the volume so wrapper.sh + the bootstrap
+  # subshell see it from boot.
+  docker run --rm -v "$vol:/v" alpine sh -c 'echo "" > /v/.pgbackrest_stanza_create_timeout'
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_stanza_create_timeout_sentinel_cleared_on_success "startup"; fail_dump t_stanza_create_timeout_sentinel_cleared_on_success "$name"; return; }
+
+  # Wait for stanza-create to complete (with a generous deadline because
+  # initdb + first-boot SQL can stretch this on a busy host).
+  local deadline=$(($(date +%s) + 60)) hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then hit=1; break; fi
+    sleep 1
+  done
+  if [ "$hit" != "1" ]; then
+    ko t_stanza_create_timeout_sentinel_cleared_on_success "stanza-create did not complete within deadline"
+    fail_dump t_stanza_create_timeout_sentinel_cleared_on_success "$name"
+    return
+  fi
+
+  # Give the rm one more poll tick in case it lands in the log just
+  # after the success line.
+  sleep 2
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_stanza_create_timeout; then
+    ko t_stanza_create_timeout_sentinel_cleared_on_success "sentinel not cleared after successful stanza-create"
+    fail_dump t_stanza_create_timeout_sentinel_cleared_on_success "$name"
+    return
+  fi
+
+  ok t_stanza_create_timeout_sentinel_cleared_on_success
+  note "stale .pgbackrest_stanza_create_timeout cleared on subsequent successful boot"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# L7. .pgbackrest_invalid_bucket sentinel is cleared on disable.
+# After a service boots with a junk bucket (sentinel written) and the
+# operator clears the env to disable archiving, the sentinel must not
+# linger on the volume — otherwise the dashboard surfaces "PITR enabled
+# but wired to junk" for a service that's actually in "never enabled"
+# state.
+t_invalid_bucket_sentinel_cleared_on_disable() {
+  local name=t-bad-cleanup-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Phase 1: boot with a UUID-shape bucket (validator rejects it).
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e WAL_ARCHIVE_BUCKET=121ccc45-0912-457e-8dc0-76625fe644bb \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e "WAL_ARCHIVE_KEY=$MINIO_USER" \
+    -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_invalid_bucket_sentinel_cleared_on_disable "phase1 startup"; fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"; return; }
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+    ko t_invalid_bucket_sentinel_cleared_on_disable "phase1 did not write invalid-bucket sentinel"
+    fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"
+    return
+  fi
+
+  # Phase 2: redeploy with no WAL_ARCHIVE_*. clear_pgbackrest_state_if_disabled
+  # must remove the sentinel as part of the WAL_ARCHIVE_BUCKET-unset branch.
+  docker rm -f "$name" >/dev/null
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_invalid_bucket_sentinel_cleared_on_disable "phase2 startup"; fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"; return; }
+
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+    ko t_invalid_bucket_sentinel_cleared_on_disable ".pgbackrest_invalid_bucket survived disable; clear function leaks it"
+    fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"
+    return
+  fi
+
+  ok t_invalid_bucket_sentinel_cleared_on_disable
+  note "invalid-bucket sentinel cleared by clear_pgbackrest_state_if_disabled on disable"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -3137,6 +3371,11 @@ ALL_TESTS=(
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
+  # audit follow-ups (H1/M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
+  t_graceful_shutdown_preserves_postmaster_pid_cleanup
+  t_gap_marker_suppresses_catalog_verify_full
+  t_stanza_create_timeout_sentinel_cleared_on_success
+  t_invalid_bucket_sentinel_cleared_on_disable
 )
 
 trap 'cleanup_test_resources' EXIT
