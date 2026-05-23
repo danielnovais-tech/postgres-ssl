@@ -634,9 +634,20 @@ sync_repo_path_from_marker
 
 log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_backoff=${GAP_RECOVERY_BACKOFF_SECONDS}s, lag_threshold=${WAL_LAG_GAP_THRESHOLD_SEGMENTS} segments, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
+# Crash-isolate each iteration in a subshell so a future refactor accident
+# (set -u trip on an unbound var, an unexpected non-zero exit, a libpq
+# environment quirk, …) doesn't terminate the outer loop. The state file +
+# .pgbackrest_gap_pending live on disk and survive across iterations, so a
+# subshell that exits mid-recovery just resumes on the next tick. This is
+# the watcher's own supervisor — keeping it inside the script (rather than
+# in wrapper.sh) means we don't fork a new PID every iteration, which
+# avoids racing postgres's stale-postmaster.pid check on container
+# restarts.
 while true; do
-  sync_repo_path_from_marker
-  watcher_iteration
+  (
+    sync_repo_path_from_marker
+    watcher_iteration
+  ) || log "iteration subshell exited non-zero, continuing"
   if [ -z "$(read_state last_full_at)" ]; then
     sleep "$INITIAL_POLL_SECONDS"
   else
