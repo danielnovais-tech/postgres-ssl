@@ -347,7 +347,20 @@ t_invalid_bucket_skips_archive() {
       ko t_invalid_bucket_skips_archive "sentinel .pgbackrest_invalid_bucket missing under PGDATA"; fail_dump t_invalid_bucket_skips_archive "$name"; return
     fi
 
-    if ! docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+    # Poll for the validator's guard log line. wait_for_pg returning is
+    # sufficient evidence that postgres + the wrapper-side init script
+    # have both run (validator fires very early, well before postgres
+    # accepts connections), but docker's json-file log driver has been
+    # observed to lag the line a few seconds beyond wait_for_pg under
+    # suite-load. Without this polling loop, the test is a flake.
+    local log_deadline=$(($(date +%s) + 30)) log_hit=0
+    while [ "$(date +%s)" -lt "$log_deadline" ]; do
+      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+        log_hit=1; break
+      fi
+      sleep 1
+    done
+    if [ "$log_hit" != "1" ]; then
       ko t_invalid_bucket_skips_archive "expected guard log line missing for bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return
     fi
 
