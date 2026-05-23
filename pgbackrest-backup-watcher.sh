@@ -237,18 +237,33 @@ run_backup() {
 }
 
 # Probes the S3 catalog for repo1 via pgbackrest info --output=json.
-# No text-parsing heuristics needed. Returns three distinct states:
-#   0 — full backup confirmed present (pgbackrest exit 0 + "full" in output)
-#   1 — conclusively no full backup (pgbackrest exit 0, no "full" entry)
-#   2 — inconclusive (pgbackrest exited non-zero: S3 unreachable, auth failure,
-#       stanza not yet created, etc.) — caller must NOT clear local state
+# Returns three distinct states:
+#   0 — full backup confirmed present
+#   1 — conclusively no full backup (pgbackrest exit 0, structured output
+#       parsed cleanly, no `.backup[]?.type == "full"` entry)
+#   2 — inconclusive (pgbackrest exit non-zero, output empty, or jq parse
+#       error — S3 unreachable, auth failure, stanza not yet created, etc.)
+#       Caller must NOT clear local state on rc=2.
+#
+# Uses jq for structured navigation rather than grep `'"type":"full"'`.
+# The grep would false-positive if a future pgbackrest schema (or a key in
+# a sibling section that happens to be named "type" with value "full")
+# matched the literal; jq with -e returns exit 1 when the filter yields
+# null/empty/false, exit 2 on parse error.
 catalog_check_backup() {
   local info_out rc
   info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null)
   rc=$?
   [ "$rc" -ne 0 ] && return 2
-  printf '%s' "$info_out" | grep -q '"type":"full"' && return 0
-  return 1
+  [ -z "$info_out" ] && return 2
+  if printf '%s' "$info_out" | jq -e '[.[]?.backup[]? | select(.type == "full")] | length > 0' >/dev/null 2>&1; then
+    return 0
+  fi
+  local jq_rc=$?
+  # jq exit 1 = filter evaluated to false → no full present (conclusive).
+  # Any other rc (2 = parse error, 3+ = other) → treat as inconclusive.
+  [ "$jq_rc" -eq 1 ] && return 1
+  return 2
 }
 
 # LAST_OBSERVED_LAG_SEGMENTS / LAST_LAG_REPO_MAX surface the most recent
@@ -257,11 +272,52 @@ LAST_OBSERVED_LAG_SEGMENTS=0
 LAST_LAG_REPO_MAX=""
 GAP_STATE_DIAG="clear"
 
-# 24-char hex WAL filename → absolute segment count (256 segments per log
-# file under the default 16 MiB wal_segment_size). Echoes empty on malformed
-# input so callers short-circuit. Strict shape check before the arithmetic
-# avoids letting a stray non-hex character feed `$((16#…))` and crash the
-# watcher via set -u + arithmetic failure.
+# SEGMENTS_PER_LOG_FILE = 0x100000000 / wal_segment_size. Default 256 (=
+# 16 MiB segsize × 256 = 4 GiB per logical log). Postgres allows
+# wal_segment_size to be set at initdb between 1 MiB and 1 GiB (powers of 2),
+# so a non-default segsize would otherwise miscompute lag by a factor of
+# (default / actual). refresh_wal_segment_size() probes pg_settings on
+# first iteration and caches; failover to a cluster with a different
+# segsize (uncommon but legal) re-probes once per iteration. Cheap: it's
+# one psql round-trip against a local socket on top of refresh_archiver_stats.
+SEGMENTS_PER_LOG_FILE=256
+WAL_SEGMENT_SIZE_BYTES=16777216
+
+# Query pg_settings for wal_segment_size (reported in 8 KiB pages, the
+# PGC_INTERNAL unit) and derive the segments-per-XLogId divisor. Sets
+# SEGMENTS_PER_LOG_FILE (and WAL_SEGMENT_SIZE_BYTES for log line clarity).
+# Failure is non-fatal: globals keep their last value (or the 16 MiB
+# default) so segment_to_number doesn't crash; the resulting lag may be
+# scaled wrong by a factor of 2 until the next successful probe, which is
+# strictly less bad than not detecting wedges at all.
+refresh_wal_segment_size() {
+  local pages
+  pages=$(psql -U postgres -tAXq -c \
+    "SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'" \
+    2>/dev/null) || return 1
+  [ -z "$pages" ] && return 1
+  case "$pages" in
+    *[!0-9]*) return 1 ;;
+  esac
+  [ "$pages" -le 0 ] && return 1
+  local bytes=$(( pages * 8 * 1024 ))
+  # 0x100000000 = 4294967296. Divisor must evenly divide it for any legal
+  # wal_segment_size (postgres enforces power-of-2 between 1 MiB and 1 GiB
+  # at initdb).
+  local per_log=$(( 4294967296 / bytes ))
+  [ "$per_log" -le 0 ] && return 1
+  SEGMENTS_PER_LOG_FILE="$per_log"
+  WAL_SEGMENT_SIZE_BYTES="$bytes"
+  return 0
+}
+
+# 24-char hex WAL filename → absolute segment count. SEGMENTS_PER_LOG_FILE
+# is sourced from postgres's wal_segment_size GUC, not hardcoded, so a
+# cluster initdb'd with --wal-segsize=32 (or 1, or 1024) computes lag
+# correctly. Echoes empty on malformed input so callers short-circuit.
+# Strict shape check before the arithmetic avoids letting a stray non-hex
+# character feed `$((16#…))` and crash the watcher via set -u +
+# arithmetic failure.
 segment_to_number() {
   local wal="$1"
   [ ${#wal} -eq 24 ] || return 0
@@ -271,7 +327,7 @@ segment_to_number() {
   local log seg
   log=$((16#${wal:8:8}))
   seg=$((16#${wal:16:8}))
-  echo $((log * 256 + seg))
+  echo $((log * SEGMENTS_PER_LOG_FILE + seg))
 }
 
 # Echoes the highest archived WAL segment on the same timeline as
@@ -501,6 +557,20 @@ decide_action() {
     DECIDED_ACTION="full"; return 0
   fi
 
+  # Gap-recovery state machine owns the .pgbackrest_gap_pending marker. While
+  # the marker is present, decide_action stays silent — gap_recovery_step
+  # already ran this iteration and either took a diff, kicked the async
+  # daemon, or is waiting on the backoff. Racing a periodic full (or worse,
+  # a catalog-verify-triggered full) on top of an in-flight recovery would
+  # burn a full at the worst time (mid-outage). The marker check MUST stay
+  # above catalog-verify: an hourly verify firing mid-gap-recovery against
+  # a wedged S3 path can see backup.info just rotated by retention and
+  # mis-conclude "no full present" → clear last_full_at → force a full,
+  # which then fails through the same wedged S3.
+  if [ -f "$GAP_MARKER" ]; then
+    return 0
+  fi
+
   # Catalog verification — periodically confirm S3 actually has a full backup.
   # Catches divergence between local state and S3 reality: the backup command
   # may have returned exit 0 without committing catalog metadata (S3 partial
@@ -516,28 +586,24 @@ decide_action() {
     needs_verify=1
   fi
   if [ "$needs_verify" -eq 1 ]; then
-    write_state_field last_catalog_verify_at "$now"
     log "verifying S3 catalog has full backup"
     catalog_check_backup
     local _crc=$?
+    # Stamp the verify timestamp only on conclusive results (rc=0 full
+    # present, rc=1 no full present). On rc=2 (inconclusive — S3 hiccup,
+    # stanza not yet created) leave the timestamp untouched so the next
+    # iteration retries instead of locking out the verify for an hour.
     if [ "$_crc" -eq 0 ]; then
+      write_state_field last_catalog_verify_at "$now"
       log "catalog verified — full backup present in S3"
     elif [ "$_crc" -eq 2 ]; then
       log "catalog check inconclusive (S3 unreachable or stanza not yet created); skipping"
     else
+      write_state_field last_catalog_verify_at "$now"
       log "catalog shows no full backup despite local state (last_full=${last_full}); clearing last_full_at to trigger new full"
       write_state_field last_full_at ""
       DECIDED_ACTION="full"; return 0
     fi
-  fi
-
-  # Gap-recovery state machine owns the .pgbackrest_gap_pending marker. While
-  # the marker is present, decide_action stays silent — gap_recovery_step
-  # already ran this iteration and either took a diff, kicked the async
-  # daemon, or is waiting on the backoff. Racing a periodic full on top of
-  # an in-flight recovery would burn a full at the worst time (mid-outage).
-  if [ -f "$GAP_MARKER" ]; then
-    return 0
   fi
 
   # Periodic full. FULL_INTERVAL_SECONDS=0 disables the periodic full while
@@ -610,6 +676,13 @@ watcher_iteration() {
     log "iteration skipped: pg_stat_archiver query failed (transient psql error)"
     return 0
   fi
+
+  # Cache wal_segment_size for segment_to_number's per-XLogId divisor.
+  # Cheap (local psql round-trip) so we re-read every iteration to handle
+  # the very-rare case of failing over onto a cluster with a different
+  # segsize. Failure leaves the previous value in place; the watcher
+  # never sees an arithmetic crash from a missing global.
+  refresh_wal_segment_size || true
 
   # Gap-recovery state machine — detects WAL/catalog divergence and drives
   # the kick-and-diff sequence. Runs every iteration; pgbackrest info is
