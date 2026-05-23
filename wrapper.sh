@@ -589,12 +589,21 @@ clear_pgbackrest_state_if_disabled() {
     # from NEEDS_INITIAL_BACKUP rather than a stale "last full was X" cache.
     [ -f "$PGDATA/.pgbackrest_backup_state" ] && rm -f "$PGDATA/.pgbackrest_backup_state" && removed=1
     [ -f "$PGDATA/.pgbackrest_gap_pending" ] && rm -f "$PGDATA/.pgbackrest_gap_pending" && removed=1
-    # Invalid-bucket sentinel + stanza-create timeout sentinel are both
-    # scoped to the configured archive bucket; clear them too so the
-    # dashboard doesn't surface "PITR enabled but wired to junk" or "stanza
+    # Stanza-create timeout sentinel is scoped to the configured archive
+    # bucket; clear it so the dashboard doesn't surface "stanza
     # bootstrap timed out" against a service whose archive is now off.
-    [ -f "$PGBACKREST_INVALID_BUCKET_MARKER" ] && rm -f "$PGBACKREST_INVALID_BUCKET_MARKER" && removed=1
     [ -f "$PGDATA/.pgbackrest_stanza_create_timeout" ] && rm -f "$PGDATA/.pgbackrest_stanza_create_timeout" && removed=1
+    #
+    # Intentionally NOT clearing $PGBACKREST_INVALID_BUCKET_MARKER here:
+    # validate_wal_archive_bucket unsets WAL_ARCHIVE_BUCKET on rejection,
+    # which makes this function see "archive disabled" and would
+    # race-delete the sentinel that pgbackrest-init.sh (initdb hook) or
+    # validate_wal_archive_bucket itself (existing-volume path) just
+    # wrote. The validator handles the sentinel lifecycle: pgbackrest-init.sh
+    # writes on a true rejection during initdb; validate_wal_archive_bucket
+    # itself rm's stale sentinels at the top of every boot when
+    # WAL_ARCHIVE_BUCKET is unset. Letting them own that file
+    # end-to-end avoids the self-overwrite.
   fi
   if [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
