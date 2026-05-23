@@ -854,9 +854,26 @@ EOF
 # Unix socket and `pgbackrest backup` runs as the right uid. The watcher gates
 # itself on WAL_ARCHIVE_BUCKET / WAL_RECOVER_FROM_BUCKET internally, so the
 # fork is unconditional and cheap when archiving isn't on.
+#
+# Supervisor: a `while true` outer loop respawns the watcher if it ever
+# exits. The watcher loop is conservative (lots of `|| true` and
+# `${var:-default}` patterns) but isn't crash-proof — a bash interpretive
+# error, a hung psql getting SIGKILLed by something, or a future
+# refactor accident could exit the child silently. The state file +
+# .pgbackrest_gap_pending live on disk and survive respawns, so a fresh
+# watcher picks the in-flight recovery state up exactly where the old
+# one left off. 5s backoff is enough to avoid tight respawn loops if
+# the watcher exits immediately on startup (would mean a real bug, but
+# the cap keeps logs readable).
 fork_pgbackrest_backup_watcher() {
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
-  gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
+  (
+    while true; do
+      gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh
+      echo "pgbackrest-watcher: exited; respawning in 5s" >&2
+      sleep 5
+    done
+  ) &
 }
 
 compute_volume_thresholds
