@@ -441,9 +441,11 @@ gap_recovery_step() {
       write_state_field force_attempts "$force_attempts"
       GAP_STATE_DIAG="forced"
     else
-      local wait_remaining=$(( GAP_RECOVERY_BACKOFF_SECONDS - since_action ))
+      # No log line during the wait — the per-iteration "iteration: no
+      # action (... gap_state=waiting ...)" diagnostic at the end of
+      # watcher_iteration already surfaces enough state for operators
+      # without printing the same line 10× per backoff cycle.
       GAP_STATE_DIAG="waiting"
-      log "gap-recovery: catalog still at ${catalog_at_detection} (lag=${lag}, attempts=${force_attempts}, ${wait_remaining}s until next pkill)"
     fi
     return 0
   fi
@@ -656,9 +658,15 @@ log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECON
 # .pgbackrest_gap_pending live on disk and survive across iterations, so a
 # subshell that exits mid-recovery just resumes on the next tick. This is
 # the watcher's own supervisor — keeping it inside the script (rather than
-# in wrapper.sh) means we don't fork a new PID every iteration, which
-# avoids racing postgres's stale-postmaster.pid check on container
-# restarts.
+# in wrapper.sh) means the watcher's long-lived PID (the bash interpreter
+# running this loop) stays pinned; only the transient iteration subshell
+# churns through PIDs, and each subshell lives a few seconds. With the
+# old wrapper.sh-side `while true; do gosu watcher; done` supervisor, the
+# watcher's long-lived PID cycled through the same range where postgres
+# lands on container start, which raced postgres's stale-postmaster.pid
+# check (PID 45 from a phase-1 SIGKILL collided with a phase-2 watcher
+# respawn at the same number, postgres saw it as a live postmaster and
+# FATAL'd). Pinning the watcher main PID makes that race impossible.
 while true; do
   (
     sync_repo_path_from_marker
