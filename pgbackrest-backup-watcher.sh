@@ -328,8 +328,18 @@ clear_gap_recovery_state() {
 # Crashed-daemon case: pkill is a no-op, respawn happens regardless.
 # Hung-daemon case: pkill removes the stuck process so respawn can succeed.
 # Spool is safe to disrupt — pgBackRest re-uploads from pg_wal on respawn.
+#
+# Target: the literal substring "archive-push:async" in the cmdline.
+# pgBackRest spawns the async daemon via cfgExecParam(cfgCmdArchivePush,
+# cfgCmdRoleAsync, ...) and cfgParseCommandRoleName (src/config/parse.c)
+# encodes the role with a colon — argv[1] of the spawned process becomes
+# "archive-push:async". The foreground caller (which runs as
+# archive_command and exits in ~300ms) has "archive-push" *without* a
+# colon, so the colon disambiguates: pkill matches the long-lived async
+# daemon but never the short-lived foreground invocation. Verify in a
+# running container with `pgrep -af archive-push:async`.
 kick_async_daemon() {
-  pkill -f 'pgbackrest .* archive-push .* --archive-async' 2>/dev/null || true
+  pkill -f 'archive-push:async' 2>/dev/null || true
 }
 
 # Recovery state machine. Replaces the old "wait for grace then take a full"
@@ -386,7 +396,13 @@ gap_recovery_step() {
       detected_at="$now"
       write_state_field last_lag_detected_at "$now"
     fi
-    if [ -z "$catalog_at_detection" ]; then
+    # Only write a real value; an empty catalog (fresh stanza, no archive
+    # entries on this timeline yet) leaves the field unset and the back-fill
+    # re-fires next iteration. Writing "" would set catalog_at_detection
+    # equal to the first non-empty catalog_max captured in a later
+    # iteration's back-fill, and we'd then never see a difference vs.
+    # current catalog_max — recovery couldn't fire.
+    if [ -z "$catalog_at_detection" ] && [ -n "$catalog_max" ]; then
       catalog_at_detection="$catalog_max"
       write_state_field catalog_max_at_detection "$catalog_at_detection"
     fi

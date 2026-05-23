@@ -1615,10 +1615,14 @@ count_archived_wal_segments() {
     | tail -1 | tr -d ' '
 }
 
-# G1. Real failure-driven gap recovery via pg_stat_archiver.failed_count
-# growth (with the .pgbackrest_gap_pending marker NEVER touched). Catches
-# the t_watcher_gap_recovery_full test's cheat: that test pokes the marker
-# directly. This one drives the watcher purely off failed_count.
+# G1. Failure-driven gap recovery via pg_stat_archiver.failed_count growth.
+# Exercises the failed_count entry condition of the gap-recovery state
+# machine — drives the watcher purely off failed_count rather than touching
+# the marker by hand. The state machine itself touches
+# .pgbackrest_gap_pending as a consequence of detection (that's the
+# "marker" used to remember we're in recovery across iterations), so this
+# test asserts the resulting gap-recovery diff lands and clears state,
+# not that the marker stays absent.
 t_watcher_gap_recovery_failed_count_path() {
   local name=t-gap-fc-${PG_VERSION}
   local vol=${name}-vol
