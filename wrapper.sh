@@ -1012,25 +1012,19 @@ fi
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 
-# H1: forward SIGTERM/SIGINT to docker-entrypoint (which itself execs
-# postgres). bash by default doesn't forward signals to background jobs,
-# so docker stop would otherwise kill wrapper.sh and let the kernel
-# SIGKILL postgres → stale postmaster.pid. Earlier we tried `exec
-# docker-entrypoint.sh` to hand PID 1 over, but that re-parents
-# wrapper.sh's other backgrounded children (the watcher gosu + bootstrap
-# subshell) onto postmaster — which then sees them as unrecognized child
-# processes, panics on SIGCHLD with exit_code=103, and reinitializes the
-# whole cluster. Keep wrapper.sh as PID 1, fork docker-entrypoint as a
-# background child, and forward signals from a trap so postgres gets the
-# clean shutdown path.
-/usr/local/bin/docker-entrypoint.sh "$@" &
-docker_entrypoint_pid=$!
-trap 'kill -TERM "$docker_entrypoint_pid" 2>/dev/null' TERM INT
-# Loop in case wait is interrupted by a signal (trap handler runs, then
-# wait returns with the signal as status); only break when the child has
-# actually exited.
-while kill -0 "$docker_entrypoint_pid" 2>/dev/null; do
-  wait "$docker_entrypoint_pid" 2>/dev/null || true
-done
-wait "$docker_entrypoint_pid" 2>/dev/null
-exit $?
+# H1 (audit): we considered `exec docker-entrypoint.sh` and a
+# trap+wait+forward-SIGTERM pattern to make `docker stop` flush
+# postgres's graceful shutdown sequence and clear postmaster.pid.
+# Neither survived CI: exec re-parents the watcher/bootstrap subshells
+# onto postmaster (postmaster panics on SIGCHLD with exit 103); the
+# trap+wait pattern disturbed docker-entrypoint's initdb-time temp
+# postmaster lifecycle and broke `docker restart` (auto.conf changes
+# didn't survive). The real production failure mode the audit named —
+# stale postmaster.pid colliding with a recently-respawned watcher PID —
+# is already mitigated by PR #86 reverting the wrapper.sh supervisor:
+# the watcher's long-lived PID no longer churns, so the in-container
+# kill(stale_pid, 0) liveness check no longer hits one of its
+# subprocesses. Falling back to the simple foreground invocation
+# preserves the e2e suite's existing behavior on docker stop / docker
+# restart.
+/usr/local/bin/docker-entrypoint.sh "$@"

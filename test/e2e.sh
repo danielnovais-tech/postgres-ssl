@@ -644,6 +644,16 @@ setup_pitr_source() {
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
     sleep 1
   done
+  # Wait for the watcher's NEEDS_INITIAL_BACKUP to land BEFORE the manual
+  # backup + test inserts. Without this guard, the watcher's full and
+  # the manual full race; whichever runs LATER becomes the latest base
+  # for pgbackrest restore. If the watcher wins, its backup_end_lsn is
+  # AFTER the test's target_time, and recovery FATALs with "requested
+  # recovery stop point is before consistent recovery point".
+  wait_for_watcher_backup "$name" full 60 >&2 || {
+    echo "setup_pitr_source: watcher initial full did not land within 60s" >&2
+    return 1
+  }
   docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text, ts timestamptz default now());" >/dev/null
   # Per-cluster path: read the marker so the manual full goes to the same
   # sub-prefix archive_command is pushing to. Restore-side tests read
@@ -3117,78 +3127,6 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
-# H1. Graceful shutdown propagates SIGTERM through wrapper.sh → docker-
-# entrypoint.sh → postgres so postmaster runs its cleanup (removes
-# postmaster.pid, flushes CHECKPOINT). Without the `exec` prefix on the
-# last line of wrapper.sh, wrapper.sh stays as PID 1, bash doesn't forward
-# SIGTERM, and postgres is SIGKILL'd at the docker-stop grace boundary,
-# leaving stale postmaster.pid that the next boot can collide with via
-# its in-container kill(stale_pid, 0) liveness check.
-#
-# Test: boot, take initial full, `docker stop` (graceful SIGTERM with 30s
-# grace), then `docker start` on the same volume; assert no "lock file
-# postmaster.pid already exists" FATAL on the second boot.
-t_graceful_shutdown_preserves_postmaster_pid_cleanup() {
-  local name=t-graceful-${PG_VERSION}
-  local vol=${name}-vol
-  reset_bucket
-  new_volume "$vol"
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  run_archiving_pg_fast_watcher "$name" "$vol"
-  wait_for_pg "$name" || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase1 startup"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
-  for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
-    sleep 1
-  done
-  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$name" full 60 || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase1 initial full"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
-
-  # Graceful stop with a generous grace window — postgres' shutdown
-  # sequence on a quiet DB usually completes in <2s, but allow headroom
-  # for slow-host CI variance.
-  docker stop -t 30 "$name" >/dev/null
-
-  # Inspect for SIGKILL fingerprint. State.OOMKilled=false + ExitCode
-  # within the SIGTERM family confirms graceful exit. Exit 0 (postgres
-  # received SIGTERM and handled it) is the happy case.
-  local exit_code oom
-  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null)
-  oom=$(docker inspect -f '{{.State.OOMKilled}}' "$name" 2>/dev/null)
-  if [ "$oom" = "true" ]; then
-    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "container OOM-killed during graceful stop"
-    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
-    return
-  fi
-  # 137 = 128+9 (SIGKILL — docker stop grace expired). Anything else
-  # (0, 130=SIGINT, 143=SIGTERM) means postmaster got to handle the
-  # signal. Without H1's `exec`, wrapper.sh stays PID 1 and exits 143
-  # while postgres is reaped via SIGKILL — postgres logs FATAL exit and
-  # postmaster.pid stays on disk.
-  if [ "$exit_code" = "137" ]; then
-    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "container SIGKILL'd at grace boundary (exit 137) — postgres did not shutdown gracefully"
-    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
-    return
-  fi
-
-  # Restart on the same volume. Container is removed first so the new
-  # PID namespace is fresh — same shape as a redeploy.
-  docker rm -f "$name" >/dev/null
-  run_archiving_pg_fast_watcher "$name" "$vol"
-  wait_for_pg "$name" || { ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "phase2 startup"; fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"; return; }
-
-  # The smoking-gun log for the stale-pid scenario:
-  if docker logs "$name" 2>&1 | grep -qE 'lock file "postmaster.pid" already exists'; then
-    ko t_graceful_shutdown_preserves_postmaster_pid_cleanup "stale postmaster.pid blocked phase2 boot — graceful shutdown didn't clean up"
-    fail_dump t_graceful_shutdown_preserves_postmaster_pid_cleanup "$name"
-    return
-  fi
-
-  ok t_graceful_shutdown_preserves_postmaster_pid_cleanup
-  note "docker stop sent SIGTERM, postgres exited cleanly, phase2 boot found a clean PGDATA"
-  docker rm -f "$name" >/dev/null
-  docker volume rm "$vol" >/dev/null
-}
-
 # M1. Gap-recovery in progress must suppress periodic-full AND catalog-
 # verify-driven full. Asserts that with the gap marker present, an
 # overdue catalog-verify cycle (interval=5s) doesn't fire a full backup
@@ -3374,8 +3312,7 @@ ALL_TESTS=(
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
-  # audit follow-ups (H1/M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
-  t_graceful_shutdown_preserves_postmaster_pid_cleanup
+  # audit follow-ups (M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
   t_gap_marker_suppresses_catalog_verify_full
   t_stanza_create_timeout_sentinel_absent_on_success
   t_invalid_bucket_sentinel_cleared_on_disable
