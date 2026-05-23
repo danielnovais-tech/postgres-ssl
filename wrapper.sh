@@ -175,18 +175,6 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # our conf.d/pgbackrest-recovery.conf path would duplicate them.
 PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 
-# Written before pgbackrest restore is invoked, cleared on success.
-# Distinguishes "wrapper is doing/did a restore" from "PGDATA was
-# populated externally" (e.g., the e2e test's pgbackrest_restore_into
-# helper, or an operator who restored by hand). If a container is killed
-# between marker-touch and marker-clear, the next boot sees both the
-# marker AND PG_VERSION and re-runs pgbackrest restore with `--delta` to
-# repair the partial PGDATA in place. Without the marker, the next boot
-# couldn't distinguish "wrapper interrupted mid-restore" from "external
-# pre-restore" and would either skip (FATAL on partial PGDATA) or
-# unconditionally retry (overwriting external work).
-PGBACKREST_RESTORE_IN_PROGRESS_MARKER="$PGDATA/.pgbackrest_restore_in_progress"
-
 # Per-cluster archive sub-path: the effective repo1-path, persisted inside
 # PGDATA so the watcher, archive-push wrapper, and stanza-create subshell
 # all converge on the same value. Per-cluster pathing means a wipe-and-
@@ -803,33 +791,35 @@ EOF
 # restore already wrote).
 #
 # Container restart on an already-restored volume: `.pgbackrest_restored`
-# is present → skip.
+# present → skip.
 #
 # Container restart on an externally-restored volume (e2e helper
 # pgbackrest_restore_into pre-populated PGDATA; operator ran their own
-# `pgbackrest restore` and brought the cluster up): PG_VERSION is
-# present, `.pgbackrest_restored` is absent, AND the in-progress marker
-# is absent. We do NOT touch this volume — configure_pgbackrest_recovery
-# handles staging the recovery params. The old PG_VERSION-only skip gate
-# is preserved for this path.
+# `pgbackrest restore` and brought the cluster up): PG_VERSION and
+# pg_control both present, `.pgbackrest_restored` absent. We do NOT
+# touch this volume — configure_pgbackrest_recovery handles staging.
+# (We can't write a private in-progress marker into PGDATA before
+# invoking pgbackrest, because pgbackrest then sees PGDATA as non-empty
+# without PG_VERSION/backup.manifest, disables --delta, and aborts.)
 #
-# Container kill mid-restore (the M2 audit case): PG_VERSION is on disk
-# but PGDATA is partial. The in-progress marker is present (we wrote it
-# before invoking pgbackrest). Re-run with `--delta` so pgbackrest
-# checksum-diffs partial PGDATA against the base manifest and only
-# refetches what's missing. The volume becomes recoverable in place
-# instead of forcing the operator to wipe it.
+# Container kill mid-restore (the M2 audit case): pgbackrest restore
+# writes pg_control LAST (the upstream design specifically guarantees
+# this: "performed last to ensure aborted restores cannot be started").
+# So PG_VERSION present + pg_control absent = partial restore. Re-run
+# pgbackrest with `--delta`: by this point backup.manifest is on disk,
+# so pgbackrest accepts --delta and checksum-diffs the partial PGDATA
+# against the base, only refetching what's missing.
 restore_from_pgbackrest_if_empty_volume() {
   # Log gate state up front so post-mortems on "why did pgbackrest restore
   # run when I expected it to be skipped" don't require guessing.
-  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) IN_PROGRESS=$([ -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) PG_CONTROL=$([ -f "$PGDATA/global/pg_control" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
 
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
-  # PG_VERSION present + no in-progress marker = externally restored.
-  # Don't touch — configure_pgbackrest_recovery handles staging.
-  if [ -f "$PGDATA/PG_VERSION" ] && [ ! -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" ]; then
+  # PG_VERSION + pg_control both present = completed external restore.
+  # Skip; configure_pgbackrest_recovery handles staging.
+  if [ -f "$PGDATA/PG_VERSION" ] && [ -f "$PGDATA/global/pg_control" ]; then
     return 0
   fi
 
@@ -897,18 +887,11 @@ EOF
   #
   # --delta makes pgbackrest checksum-diff $PGDATA against the base
   # manifest and refetch only the files that differ. On a fresh-volume
-  # restore this adds the overhead of one local checksum pass (PGDATA is
-  # nearly empty, so the cost is negligible). On a partial-PGDATA retry
-  # (container killed mid-restore left the in-progress marker on disk),
-  # --delta repairs in place rather than refusing to overwrite. Mirrors
-  # postgres-ssl audit M2.
-  #
-  # The in-progress marker is set before the call and cleared after
-  # success. A failed restore leaves it on disk so the next boot's gate
-  # recognizes "wrapper was mid-restore, retry with --delta" rather than
-  # "PGDATA was populated externally, leave it alone."
-  touch "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER"
-  chown postgres:postgres "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" 2>/dev/null || true
+  # restore pgbackrest disables --delta itself (no PG_VERSION /
+  # backup.manifest yet — full restore is the only sane option anyway).
+  # On a partial-PGDATA retry (container killed mid-restore: PGDATA has
+  # PG_VERSION + backup.manifest but no pg_control), pgbackrest accepts
+  # --delta and repairs in place. Mirrors postgres-ssl audit M2.
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
        --stanza=main \
        --pg1-path="$PGDATA" \
@@ -923,7 +906,6 @@ EOF
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
-  rm -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" 2>/dev/null || true
 
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
