@@ -1099,7 +1099,7 @@ t_disable_cleanup() {
 # triggered by .pgbackrest_gap_pending, periodic full + diff cadence,
 # empty-volume restore from S3, retention-driven expire, and the dual-repo
 # guard. Tests pass WAL_BACKUP_POLL_INTERVAL_SECONDS=5 and
-# WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 so the watcher's decision loop
+# WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10 so the watcher's decision loop
 # turns over fast enough for second-scale assertions.
 #
 # Standby-branch coverage (HA replica exits early via pg_is_in_recovery) is
@@ -1133,7 +1133,7 @@ run_archiving_pg_fast_watcher() {
   local name="$1" vol="$2"; shift 2
   run_archiving_pg "$name" "$vol" \
     -e "WAL_BACKUP_POLL_INTERVAL_SECONDS=5" \
-    -e "WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10" \
+    -e "WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10" \
     "$@"
 }
 
@@ -1325,40 +1325,41 @@ t_watcher_gap_recovery_full() {
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_full "no initial full"; return; }
 
-  local before_count
-  before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+  local before_diff_count
+  before_diff_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
 
-  # Drop the gap marker by hand (no real failures to keep the test fast). The
-  # watcher's gap_recovered() trivially-recovers when LAST_FAILED_EPOCH=0
-  # (pg_stat_archiver clean), so the marker alone is enough to fire the
-  # gap-recovery branch on the next poll.
+  # Drop the gap marker by hand (simulates a wrapper-touched failure where
+  # we want recovery without orchestrating a real archive-push outage).
+  # On the next iteration, gap_recovery_step sees the marker, back-fills
+  # state with current catalog max, and waits for the catalog to advance.
   docker exec -u postgres "$name" touch /var/lib/postgresql/data/.pgbackrest_gap_pending
 
-  # `cleared gap marker` is emitted right before `backup --type=full
-  # completed` in run_backup(). Wait on both signals inside the loop —
-  # checking them separately races against docker's stdout flush window
-  # (the two echoes can land in different `docker logs` snapshots even
-  # though the watcher emits them back-to-back in the same shell).
-  local deadline=$(($(date +%s) + 30)) hit=0
+  # Force WAL to keep flowing so archive-push runs and the catalog advances
+  # past the back-filled detection point. Once advance is observed, the
+  # state machine fires a diff backup to anchor a fresh restore point.
+  # Loop because a single switch may race the watcher's next iteration —
+  # the diff fires the iteration AFTER catalog advance is observed.
+  local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    local logs now_count
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    local logs now_diff_count
     logs=$(docker logs "$name" 2>&1)
-    now_count=$(echo "$logs" | grep -c "backup --type=full completed" || true)
-    if [ "$now_count" -gt "$before_count" ] \
-       && echo "$logs" | grep -q "cleared gap marker"; then
+    now_diff_count=$(echo "$logs" | grep -c "backup --type=diff completed" || true)
+    if [ "$now_diff_count" -gt "$before_diff_count" ] \
+       && echo "$logs" | grep -q "cleared by gap-recovery diff"; then
       hit=1; break
     fi
-    sleep 2
+    sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_full "watcher did not take gap-recovery full or did not log 'cleared gap marker'"
+    ko t_watcher_gap_recovery_full "watcher did not take gap-recovery diff or did not log 'cleared by gap-recovery diff'"
     fail_dump t_watcher_gap_recovery_full "$name"
     return
   fi
 
-  # Marker should be cleared by run_backup() after the full lands.
+  # Marker should be cleared by clear_gap_recovery_state() after the diff.
   if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
-    ko t_watcher_gap_recovery_full ".pgbackrest_gap_pending was not cleared after gap-recovery full"
+    ko t_watcher_gap_recovery_full ".pgbackrest_gap_pending was not cleared after gap-recovery diff"
     return
   fi
 
@@ -1614,10 +1615,14 @@ count_archived_wal_segments() {
     | tail -1 | tr -d ' '
 }
 
-# G1. Real failure-driven gap recovery via pg_stat_archiver.failed_count
-# growth (with the .pgbackrest_gap_pending marker NEVER touched). Catches
-# the t_watcher_gap_recovery_full test's cheat: that test pokes the marker
-# directly. This one drives the watcher purely off failed_count.
+# G1. Failure-driven gap recovery via pg_stat_archiver.failed_count growth.
+# Exercises the failed_count entry condition of the gap-recovery state
+# machine — drives the watcher purely off failed_count rather than touching
+# the marker by hand. The state machine itself touches
+# .pgbackrest_gap_pending as a consequence of detection (that's the
+# "marker" used to remember we're in recovery across iterations), so this
+# test asserts the resulting gap-recovery diff lands and clears state,
+# not that the marker stays absent.
 t_watcher_gap_recovery_failed_count_path() {
   local name=t-gap-fc-${PG_VERSION}
   local vol=${name}-vol
@@ -1652,7 +1657,7 @@ t_watcher_gap_recovery_failed_count_path() {
     -e WAL_DROP_THRESHOLD_MB=999999 \
     -e POSTGRES_ARCHIVE_TIMEOUT=5 \
     -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
-    -e WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 \
+    -e WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10 \
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
   wait_for_pg "$name" || { ko t_watcher_gap_recovery_failed_count_path "no startup"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
@@ -1664,8 +1669,8 @@ t_watcher_gap_recovery_failed_count_path() {
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_failed_count_path "no initial full"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
 
-  local before_count
-  before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+  local before_diff_count
+  before_diff_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
 
   # Switch the user to read-only → PutObject fails with AccessDenied →
   # archive_command returns non-zero (wrapper threshold not met) → Postgres
@@ -1690,15 +1695,12 @@ t_watcher_gap_recovery_failed_count_path() {
     return
   fi
 
-  # Marker should NOT have been written — that's the whole point of this
-  # test (proves the failed_count branch fires independently of the marker).
-  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
-    ko t_watcher_gap_recovery_failed_count_path ".pgbackrest_gap_pending was written; threshold should not have tripped"
-    return
-  fi
-
-  # Restore write access → archive-push succeeds again → grace window starts
-  # from last_failed_time. Wait grace + a few polls.
+  # Restore write access → archive-push succeeds again → catalog advances
+  # past detection point → state machine takes a diff to re-anchor the
+  # PITR window. (Marker may have been written by the failed_count entry
+  # condition — that's fine; it's the wrapper-threshold marker we're
+  # exercising in the OTHER test, this one exercises the failed_count
+  # entry condition into the same state machine.)
   mc "
     mc admin policy detach local readonly --user ${user} 2>/dev/null || true
     mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
@@ -1706,19 +1708,21 @@ t_watcher_gap_recovery_failed_count_path() {
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
     local now_count
-    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
-    if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
-    sleep 2
+    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
+    if [ "$now_count" -gt "$before_diff_count" ]; then hit=1; break; fi
+    sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery full via failed_count path"
+    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery diff via failed_count path"
     fail_dump t_watcher_gap_recovery_failed_count_path "$name"
     return
   fi
 
   # last_full_failed_count must have advanced past 0 — otherwise next
-  # iteration would re-trigger immediately.
+  # iteration would re-trigger immediately. clear_gap_recovery_state
+  # writes this field as part of post-diff cleanup.
   local last_failed_in_state
   last_failed_in_state=$(docker exec "$name" grep -E "^last_full_failed_count=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
   if [ -z "$last_failed_in_state" ] || [ "$last_failed_in_state" = "0" ]; then
@@ -1727,7 +1731,7 @@ t_watcher_gap_recovery_failed_count_path() {
   fi
 
   ok t_watcher_gap_recovery_failed_count_path
-  note "failed_count=${failed_count} → grace → 2nd full; marker never written; last_full_failed_count=${last_failed_in_state}"
+  note "failed_count=${failed_count} → catalog advanced → gap-recovery diff; last_full_failed_count=${last_failed_in_state}"
   mc "mc admin user remove local ${user}" >/dev/null 2>&1 || true
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
@@ -1745,7 +1749,7 @@ t_watcher_gap_recovery_failed_count_path() {
 # repo catalog moving).
 #
 # The unique-to-LSN-lag fingerprint is `last_lag_detected_at` in the
-# watcher state file — only `check_lsn_lag_and_mark_gap` writes it. This
+# watcher state file — only `gap_recovery_step` writes it. This
 # test asserts the probe fired by checking that field, plus the absence
 # of wrapper-side drop log lines (which would mean the wrapper, not the
 # probe, wrote the marker).
@@ -1785,8 +1789,7 @@ t_watcher_gap_recovery_lsn_lag_path() {
     -e PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX=128MiB \
     -e WAL_DROP_THRESHOLD_MB=999999 \
     -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
-    -e WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 \
-    -e WAL_LAG_PROBE_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10 \
     -e WAL_LAG_GAP_THRESHOLD_SEGMENTS=4 \
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
@@ -1799,11 +1802,12 @@ t_watcher_gap_recovery_lsn_lag_path() {
     docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series($((i*80000)), $(((i+1)*80000))) g; SELECT pg_switch_wal();" >/dev/null 2>&1
   done
 
-  # Wait for the probe to write the gap marker. WAL_LAG_PROBE_INTERVAL_SECONDS=5
-  # and POLL_INTERVAL_SECONDS=5 → detection within ~10-15s of the first drop.
-  # Poll on the marker FILE rather than a specific log line because docker
-  # log timing through high-volume pgbackrest output can race a one-shot
-  # "gap detected" line; the marker + state file are durable evidence.
+  # Wait for the probe to write the gap marker. Detection runs every
+  # iteration (POLL_INTERVAL_SECONDS=5) → marker should land within
+  # ~10-15s of the first drop. Poll on the marker FILE rather than a
+  # specific log line because docker log timing through high-volume
+  # pgbackrest output can race a one-shot "gap detected" line; the marker
+  # + state file are durable evidence.
   local deadline=$(($(date +%s) + 90)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending 2>/dev/null; then
@@ -1823,24 +1827,24 @@ t_watcher_gap_recovery_lsn_lag_path() {
   sleep 3
 
   # Assert: last_lag_detected_at recorded in the watcher state file. This
-  # is the durable fingerprint of the LSN-lag probe — only
-  # check_lsn_lag_and_mark_gap writes this field, so its presence proves
-  # the watcher's probe (not the wrapper, not the failed_count branch)
-  # wrote the gap marker. Tested via the state file rather than a log line
-  # because docker's json-file log driver under high-volume pgbackrest
-  # error output (each failed PUT is ~3-4 KiB of XML) intermittently fails
-  # to surface specific log lines to `docker logs | grep` in this CI's
-  # harness — the state file is robust to that timing.
+  # is the durable fingerprint of the LSN-lag detection branch — only
+  # gap_recovery_step writes this field on new detection (the
+  # wrapper-touched path back-fills it on the same iteration). Tested via
+  # the state file rather than a log line because docker's json-file log
+  # driver under high-volume pgbackrest error output (each failed PUT is
+  # ~3-4 KiB of XML) intermittently fails to surface specific log lines
+  # to `docker logs | grep` in this CI's harness — the state file is
+  # robust to that timing.
   local last_lag_at
   last_lag_at=$(docker exec "$name" grep -E "^last_lag_detected_at=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
   if [ -z "$last_lag_at" ] || [ "$last_lag_at" = "0" ]; then
-    ko t_watcher_gap_recovery_lsn_lag_path "last_lag_detected_at not written to state (got '$last_lag_at') — LSN-lag probe did not fire"
+    ko t_watcher_gap_recovery_lsn_lag_path "last_lag_detected_at not written to state (got '$last_lag_at') — LSN-lag detection did not fire"
     fail_dump t_watcher_gap_recovery_lsn_lag_path "$name"
     return
   fi
 
   ok t_watcher_gap_recovery_lsn_lag_path
-  note "LSN-lag probe wrote marker + last_lag_detected_at=${last_lag_at}"
+  note "LSN-lag detection wrote marker + last_lag_detected_at=${last_lag_at}"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }

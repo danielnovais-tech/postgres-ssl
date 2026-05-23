@@ -854,6 +854,19 @@ EOF
 # Unix socket and `pgbackrest backup` runs as the right uid. The watcher gates
 # itself on WAL_ARCHIVE_BUCKET / WAL_RECOVER_FROM_BUCKET internally, so the
 # fork is unconditional and cheap when archiving isn't on.
+#
+# Single watcher process — no external respawn wrapper. The watcher's own
+# main loop runs each iteration in a subshell so set -u / set -e style
+# aborts inside an iteration don't kill the outer loop. An external
+# `while true; do watcher; done` supervisor would cycle the watcher's
+# long-lived PID across respawns (each respawn = new gosu + new bash
+# interpreter), which races the stale-postmaster.pid check in postgres
+# startup on container restarts: postgres reads "PID 45" from the stale
+# file, sends signal 0, and a recently-respawned watcher main process
+# happens to occupy that PID → postgres FATALs instead of clearing the
+# stale file. With the watcher's own main loop holding a fixed PID, only
+# the transient iteration subshell churns (always short-lived,
+# never lands in postmaster.pid's range at container-start time).
 fork_pgbackrest_backup_watcher() {
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
   gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
