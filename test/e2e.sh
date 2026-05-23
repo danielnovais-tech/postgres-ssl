@@ -1665,8 +1665,8 @@ t_watcher_gap_recovery_failed_count_path() {
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_failed_count_path "no initial full"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
 
-  local before_count
-  before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+  local before_diff_count
+  before_diff_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
 
   # Switch the user to read-only → PutObject fails with AccessDenied →
   # archive_command returns non-zero (wrapper threshold not met) → Postgres
@@ -1691,15 +1691,12 @@ t_watcher_gap_recovery_failed_count_path() {
     return
   fi
 
-  # Marker should NOT have been written — that's the whole point of this
-  # test (proves the failed_count branch fires independently of the marker).
-  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
-    ko t_watcher_gap_recovery_failed_count_path ".pgbackrest_gap_pending was written; threshold should not have tripped"
-    return
-  fi
-
-  # Restore write access → archive-push succeeds again → grace window starts
-  # from last_failed_time. Wait grace + a few polls.
+  # Restore write access → archive-push succeeds again → catalog advances
+  # past detection point → state machine takes a diff to re-anchor the
+  # PITR window. (Marker may have been written by the failed_count entry
+  # condition — that's fine; it's the wrapper-threshold marker we're
+  # exercising in the OTHER test, this one exercises the failed_count
+  # entry condition into the same state machine.)
   mc "
     mc admin policy detach local readonly --user ${user} 2>/dev/null || true
     mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
@@ -1707,19 +1704,21 @@ t_watcher_gap_recovery_failed_count_path() {
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
     local now_count
-    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
-    if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
-    sleep 2
+    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
+    if [ "$now_count" -gt "$before_diff_count" ]; then hit=1; break; fi
+    sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery full via failed_count path"
+    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery diff via failed_count path"
     fail_dump t_watcher_gap_recovery_failed_count_path "$name"
     return
   fi
 
   # last_full_failed_count must have advanced past 0 — otherwise next
-  # iteration would re-trigger immediately.
+  # iteration would re-trigger immediately. clear_gap_recovery_state
+  # writes this field as part of post-diff cleanup.
   local last_failed_in_state
   last_failed_in_state=$(docker exec "$name" grep -E "^last_full_failed_count=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
   if [ -z "$last_failed_in_state" ] || [ "$last_failed_in_state" = "0" ]; then
@@ -1728,7 +1727,7 @@ t_watcher_gap_recovery_failed_count_path() {
   fi
 
   ok t_watcher_gap_recovery_failed_count_path
-  note "failed_count=${failed_count} → grace → 2nd full; marker never written; last_full_failed_count=${last_failed_in_state}"
+  note "failed_count=${failed_count} → catalog advanced → gap-recovery diff; last_full_failed_count=${last_failed_in_state}"
   mc "mc admin user remove local ${user}" >/dev/null 2>&1 || true
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null

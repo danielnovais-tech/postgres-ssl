@@ -222,11 +222,9 @@ run_backup() {
     full)
       write_state_field last_full_at "$now"
       write_state_field last_diff_at "$now"
-      # Re-read failed_count *after* the backup so a failure during the
-      # backup itself is folded into the high-water mark; otherwise the
-      # next iteration would see growth and re-trigger immediately.
-      refresh_archiver_stats || true
-      write_state_field last_full_failed_count "$FAILED_COUNT"
+      # clear_gap_recovery_state refreshes pg_stat_archiver and writes
+      # last_full_failed_count itself — folds failures-during-backup into
+      # the anchor so the next iteration doesn't re-fire detection.
       clear_gap_recovery_state "cleared by full backup"
       ;;
     diff|incr)
@@ -307,8 +305,14 @@ probe_catalog_max() {
 
 # Clears all gap-recovery state (marker file + state fields). Called after a
 # successful diff (recovery confirmed) or full (re-anchors the baseline).
+# Re-reads pg_stat_archiver to fold any failed pushes during the backup we
+# just ran into the failed_count anchor — without this the next iteration
+# would see FAILED_COUNT > last_full_failed_count and immediately re-fire
+# detection.
 clear_gap_recovery_state() {
   local reason="${1:-cleared}"
+  refresh_archiver_stats || true
+  write_state_field last_full_failed_count "${FAILED_COUNT:-0}"
   write_state_field last_lag_detected_at 0
   write_state_field catalog_max_at_detection ""
   write_state_field last_force_recovery_at 0
@@ -428,15 +432,25 @@ gap_recovery_step() {
     return 0
   fi
 
-  # Not in recovery. New detection?
-  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ]; then
+  # Not in recovery. Two independent entry conditions, both meaning
+  # "WAL coverage is diverging from the catalog":
+  #   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres
+  #     keeps handing off, async doesn't drain to S3)
+  #   - failed_count grew since the last full's anchor (foreground hard
+  #     failure — archive_command returning non-zero so postgres never
+  #     hands off; lag stays at 0 but archiving is broken just the same)
+  local last_full_failed; last_full_failed=$(read_state last_full_failed_count); : "${last_full_failed:=0}"
+  local failed_grew=0
+  [ "${FAILED_COUNT:-0}" -gt "$last_full_failed" ] && failed_grew=1
+
+  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
     touch "$GAP_MARKER"
     write_state_field last_lag_detected_at "$now"
     write_state_field catalog_max_at_detection "$catalog_max"
     write_state_field last_force_recovery_at 0
     write_state_field force_attempts 0
     GAP_STATE_DIAG="detected"
-    log "gap-recovery: lag=${lag} segments ≥ threshold ${WAL_LAG_GAP_THRESHOLD_SEGMENTS} (handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — entering recovery; first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if catalog hasn't advanced"
+    log "gap-recovery: entering recovery (lag=${lag}, failed_count=${FAILED_COUNT:-0} vs anchor ${last_full_failed}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if catalog hasn't advanced"
   else
     GAP_STATE_DIAG="clear"
   fi
