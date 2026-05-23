@@ -175,6 +175,18 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # our conf.d/pgbackrest-recovery.conf path would duplicate them.
 PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 
+# Written before pgbackrest restore is invoked, cleared on success.
+# Distinguishes "wrapper is doing/did a restore" from "PGDATA was
+# populated externally" (e.g., the e2e test's pgbackrest_restore_into
+# helper, or an operator who restored by hand). If a container is killed
+# between marker-touch and marker-clear, the next boot sees both the
+# marker AND PG_VERSION and re-runs pgbackrest restore with `--delta` to
+# repair the partial PGDATA in place. Without the marker, the next boot
+# couldn't distinguish "wrapper interrupted mid-restore" from "external
+# pre-restore" and would either skip (FATAL on partial PGDATA) or
+# unconditionally retry (overwriting external work).
+PGBACKREST_RESTORE_IN_PROGRESS_MARKER="$PGDATA/.pgbackrest_restore_in_progress"
+
 # Per-cluster archive sub-path: the effective repo1-path, persisted inside
 # PGDATA so the watcher, archive-push wrapper, and stanza-create subshell
 # all converge on the same value. Per-cluster pathing means a wipe-and-
@@ -791,22 +803,35 @@ EOF
 # restore already wrote).
 #
 # Container restart on an already-restored volume: `.pgbackrest_restored`
-# is present → skip. We deliberately do NOT skip on `PG_VERSION` alone —
-# a container kill mid-restore leaves PG_VERSION on disk but the rest of
-# PGDATA partial; in that case `.pgbackrest_restored` is absent and we
-# re-run with `--delta` so pgbackrest checksum-diffs the partial PGDATA
-# against the base and only refetches what's missing. The previous
-# PG_VERSION-only gate caused those partial-restore volumes to silently
-# skip pgbackrest and FATAL on the next postgres start, forcing the
-# operator to wipe the volume.
+# is present → skip.
+#
+# Container restart on an externally-restored volume (e2e helper
+# pgbackrest_restore_into pre-populated PGDATA; operator ran their own
+# `pgbackrest restore` and brought the cluster up): PG_VERSION is
+# present, `.pgbackrest_restored` is absent, AND the in-progress marker
+# is absent. We do NOT touch this volume — configure_pgbackrest_recovery
+# handles staging the recovery params. The old PG_VERSION-only skip gate
+# is preserved for this path.
+#
+# Container kill mid-restore (the M2 audit case): PG_VERSION is on disk
+# but PGDATA is partial. The in-progress marker is present (we wrote it
+# before invoking pgbackrest). Re-run with `--delta` so pgbackrest
+# checksum-diffs partial PGDATA against the base manifest and only
+# refetches what's missing. The volume becomes recoverable in place
+# instead of forcing the operator to wipe it.
 restore_from_pgbackrest_if_empty_volume() {
   # Log gate state up front so post-mortems on "why did pgbackrest restore
   # run when I expected it to be skipped" don't require guessing.
-  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) IN_PROGRESS=$([ -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
 
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
+  # PG_VERSION present + no in-progress marker = externally restored.
+  # Don't touch — configure_pgbackrest_recovery handles staging.
+  if [ -f "$PGDATA/PG_VERSION" ] && [ ! -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" ]; then
+    return 0
+  fi
 
   echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 
@@ -873,11 +898,17 @@ EOF
   # --delta makes pgbackrest checksum-diff $PGDATA against the base
   # manifest and refetch only the files that differ. On a fresh-volume
   # restore this adds the overhead of one local checksum pass (PGDATA is
-  # nearly empty, so the cost is negligible). On a partial-PGDATA restart
-  # (container killed mid-restore leaves PG_VERSION + some files; the
-  # PG_VERSION-only skip-gate is gone above, so we land here), --delta
-  # repairs in place rather than refusing to overwrite a non-empty dir.
-  # Mirrors postgres-ssl audit M2.
+  # nearly empty, so the cost is negligible). On a partial-PGDATA retry
+  # (container killed mid-restore left the in-progress marker on disk),
+  # --delta repairs in place rather than refusing to overwrite. Mirrors
+  # postgres-ssl audit M2.
+  #
+  # The in-progress marker is set before the call and cleared after
+  # success. A failed restore leaves it on disk so the next boot's gate
+  # recognizes "wrapper was mid-restore, retry with --delta" rather than
+  # "PGDATA was populated externally, leave it alone."
+  touch "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER"
+  chown postgres:postgres "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" 2>/dev/null || true
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
        --stanza=main \
        --pg1-path="$PGDATA" \
@@ -892,6 +923,7 @@ EOF
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
+  rm -f "$PGBACKREST_RESTORE_IN_PROGRESS_MARKER" 2>/dev/null || true
 
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
@@ -998,11 +1030,25 @@ fi
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 
-# exec so docker-entrypoint becomes PID 1; it then execs gosu+postgres,
-# making postgres PID 1 directly. SIGTERM from `docker stop` lands on
-# postgres, which runs its graceful shutdown sequence (drain connections,
-# CHECKPOINT, remove postmaster.pid). Without exec, wrapper.sh would stay
-# as PID 1 — bash doesn't forward SIGTERM to children, so postgres would
-# be SIGKILL'd at the 10s grace boundary and leave a stale postmaster.pid
-# behind for the next boot to fight with.
-exec /usr/local/bin/docker-entrypoint.sh "$@"
+# H1: forward SIGTERM/SIGINT to docker-entrypoint (which itself execs
+# postgres). bash by default doesn't forward signals to background jobs,
+# so docker stop would otherwise kill wrapper.sh and let the kernel
+# SIGKILL postgres → stale postmaster.pid. Earlier we tried `exec
+# docker-entrypoint.sh` to hand PID 1 over, but that re-parents
+# wrapper.sh's other backgrounded children (the watcher gosu + bootstrap
+# subshell) onto postmaster — which then sees them as unrecognized child
+# processes, panics on SIGCHLD with exit_code=103, and reinitializes the
+# whole cluster. Keep wrapper.sh as PID 1, fork docker-entrypoint as a
+# background child, and forward signals from a trap so postgres gets the
+# clean shutdown path.
+/usr/local/bin/docker-entrypoint.sh "$@" &
+docker_entrypoint_pid=$!
+trap 'kill -TERM "$docker_entrypoint_pid" 2>/dev/null' TERM INT
+# Loop in case wait is interrupted by a signal (trap handler runs, then
+# wait returns with the signal as status); only break when the child has
+# actually exited.
+while kill -0 "$docker_entrypoint_pid" 2>/dev/null; do
+  wait "$docker_entrypoint_pid" 2>/dev/null || true
+done
+wait "$docker_entrypoint_pid" 2>/dev/null
+exit $?
