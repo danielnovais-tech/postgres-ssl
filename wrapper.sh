@@ -29,6 +29,31 @@ SSL_DIR="/var/lib/postgresql/data/certs"
 INIT_SSL_SCRIPT="/docker-entrypoint-initdb.d/init-ssl.sh"
 POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 
+# H1 (audit follow-up): clear stale postmaster.pid. wrapper.sh runs once
+# at container start — no postgres has been spawned yet — so any
+# postmaster.pid on disk is from a previous container that didn't get a
+# graceful shutdown (docker rm -f sends SIGKILL; the kernel reaps
+# postgres before it can remove its pid file).
+#
+# Postgres normally self-heals: on start it reads postmaster.pid, calls
+# kill(pid, 0), and removes the file if the PID is dead. The trouble in
+# a container is that postgres ALSO checks if the PID belongs to the
+# same UID — and the watcher's psql/pg_isready subprocesses run as the
+# same postgres UID, so the stale PID number often points at a live
+# (unrelated) watcher subprocess. postgres reads same-UID + alive →
+# concludes "another postmaster is already running" → FATAL.
+#
+# Removing the file unconditionally here is safe because (a) wrapper.sh
+# is the container entrypoint and runs exactly once per container, (b)
+# no postgres process is running at this point, and (c) docker
+# guarantees only one wrapper.sh per container instance. Avoids the
+# need for a graceful-shutdown handoff that re-parents children onto
+# postmaster (postmaster panics with SIGCHLD on unknown children).
+if [ -f "$PGDATA/postmaster.pid" ]; then
+  echo "wrapper: removing stale $PGDATA/postmaster.pid (no postgres running at container start)"
+  rm -f "$PGDATA/postmaster.pid" 2>/dev/null || true
+fi
+
 # Regenerate if the certificate is not a x509v3 certificate
 if [ -f "$SSL_DIR/server.crt" ] && ! openssl x509 -noout -text -in "$SSL_DIR/server.crt" | grep -q "DNS:localhost"; then
   echo "Did not find a x509v3 certificate, regenerating certificates..."
