@@ -2334,10 +2334,11 @@ t_restore_then_wipe_volume_redoes_restore() {
   wait_for_pg "$rest_name" || { ko t_restore_then_wipe_volume_redoes_restore "2nd boot after wipe"; fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"; return; }
 
   # Poll for the restore log line — wrapper writes it before pgbackrest
-  # actually runs, so wait_for_pg returning is sufficient evidence that
-  # the line is in the buffer, but harmless to give it a couple seconds
-  # in case docker's log shipping lags under suite-load.
-  local deadline=$(($(date +%s) + 10)) hit=0
+  # actually runs, so wait_for_pg returning should be sufficient evidence
+  # that the line is in the buffer. Use a generous deadline anyway —
+  # docker's json-file log shipping has been observed to lag a few
+  # seconds beyond wait_for_pg under suite-load on slow runners.
+  local deadline=$(($(date +%s) + 30)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
       hit=1; break

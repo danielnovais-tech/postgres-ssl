@@ -907,6 +907,18 @@ EOF
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
 
+  # pgbackrest restore copies ALL of PGDATA — including the source's
+  # watcher state (`.pgbackrest_backup_state` with source's last_full_at,
+  # last_full_failed_count) and any in-flight gap-recovery marker. On
+  # the fork's own bucket those values are meaningless and they cause
+  # the watcher to mis-detect: source's last_full_at makes
+  # NEEDS_INITIAL_BACKUP skip even though the fork's bucket is empty,
+  # while source's last_full_failed_count vs fork's fresh failed_count
+  # triggers a phantom gap-recovery cycle that blocks the watcher's
+  # actual first full. Wipe so the fork starts from a clean slate.
+  rm -f "$PGDATA/.pgbackrest_backup_state" 2>/dev/null || true
+  rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
 
