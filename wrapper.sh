@@ -133,17 +133,21 @@ fi
 # Two orthogonal thresholds gate the "WAL is accumulating, do something":
 #   - archive-push-queue-max (set in /etc/pgbackrest/pgbackrest.conf) governs
 #     the SPOOL. Trips on transient S3 stalls; pgBackRest drops segments
-#     from spool and reports success to archive_command. Generous buffer
-#     to absorb multi-hour outages cleanly. Default 5 GiB on volumes ≥10 GiB;
-#     scales down to ~50% of volume below that (see compute_volume_thresholds).
+#     from spool and reports success to archive_command. Default 5 GiB on
+#     volumes ≥10 GiB; scales down to ~50% of volume below that (see
+#     compute_volume_thresholds).
 #   - pgbackrest-archive-push-wrapper.sh's WAL_DROP_THRESHOLD_MB governs
-#     pg_wal/. Trips on HARD failures (bad creds, deleted bucket, expired
-#     keys) where pgbackrest's foreground returns non-zero and retrying
-#     without operator intervention has zero chance of success. Smaller
-#     cap because we shouldn't hold 5 GiB of pg_wal hostage waiting for a
-#     config fix. Default 500 MiB on volumes ≥5 GiB; scales down to ~10%
-#     of volume below that, floor 64 MiB.
-# Either way, PITR window truncates; DB stays up.
+#     pg_wal/ AND minimum free disk. Pre-archive: drop if pg_wal exceeds
+#     threshold OR the data volume has less free space than threshold,
+#     before invoking pgbackrest — catches the "archiving succeeds but
+#     throughput < WAL generation" regime that the reactive post-failure
+#     check missed (every pgbackrest call returned 0, pg_wal grew to 28 GiB
+#     anyway, Postgres ran out of disk). Post-archive: drop on hard
+#     pgbackrest failure if past threshold. Default 5 GiB on volumes
+#     ≥50 GiB; scales down to ~10% of volume below that, floor 64 MiB.
+# Either way, PITR window truncates; DB stays up. Every drop path touches
+# the .pgbackrest_gap_pending marker so pgbackrest-backup-watcher.sh takes
+# a fresh diff once archiving recovers, anchoring forward-restore coverage.
 # -----------------------------------------------------------------------------
 
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
@@ -196,8 +200,8 @@ PGBACKREST_INVALID_BUCKET_MARKER="$PGDATA/.pgbackrest_invalid_bucket"
 # off — same behavior as "never enabled." Without this, an unresolved
 # `${{<bucket-id>.BUCKET}}` would land in /etc/pgbackrest/pgbackrest.conf
 # verbatim; pgBackRest would then hard-fail every archive_command and
-# pgbackrest-archive-push-wrapper.sh's 500 MiB WAL-drop threshold would
-# eventually trip — creating a real, unrecoverable PITR gap from what is
+# pgbackrest-archive-push-wrapper.sh's pg_wal threshold would eventually
+# trip — creating a real, unrecoverable PITR gap from what is
 # really an upstream wiring bug. The sentinel file lets the dashboard
 # surface this state distinctly from the no-config and unresolvable-creds
 # states.
@@ -354,37 +358,37 @@ detect_volume_total_kib() {
 
 # Compute volume-proportional WAL/spool thresholds and write them to globals
 # COMPUTED_WAL_DROP_MB + COMPUTED_QUEUE_MAX_MIB. Both scale DOWN from the
-# absolute defaults (500 MiB pg_wal drop / 5 GiB spool queue-max) on smaller
-# volumes — never up. Hobby's 1 GiB volume can't carry 5 GiB of spool, and
-# 500 MiB of pg_wal is half the disk; on a 25+ GiB volume the absolutes hold.
+# absolute default (5 GiB) on smaller volumes — never up. Hobby's 1 GiB volume
+# can't carry 5 GiB of either; on a 50+ GiB volume the absolutes hold.
 #
-# Ratios: wal-drop ~ 10% of volume (hard-failure pg_wal hostage), queue-max
-# ~ 50% of volume (transient-stall spool absorption). The 10× spread between
-# the two budgets is preserved across all volume sizes — hard failures still
-# bail fast, transient stalls still absorb generously.
+# Ratios: wal-drop ~10% of volume, queue-max ~50% of volume. wal-drop bounds
+# pg_wal AND the minimum free disk we keep available for Postgres to operate;
+# queue-max is the spool budget for absorbing transient S3 stalls. Both cap
+# at 5 GiB so pg_wal + spool together can never exceed ~10 GiB of WAL-related
+# on-disk footprint, regardless of how big the customer's data volume is.
 #
-# Floor: 64 MiB on wal-drop (~4 WAL segments — enough for one short stall),
-# 128 MiB on queue-max (~8 segments). Below these, archiving is effectively
-# disabled and the dashboard surfaces it.
+# Floor: 64 MiB on wal-drop (~4 WAL segments), 128 MiB on queue-max (~8
+# segments). Below these archiving is effectively off and the dashboard
+# surfaces it.
 compute_volume_thresholds() {
-  local total_kib total_mib wal_drop queue_max cap_queue
+  local total_kib total_mib wal_drop queue_max cap_max
+  cap_max=$(( 5 * 1024 ))
   total_kib=$(detect_volume_total_kib)
   if [ "$total_kib" -lt 1 ]; then
-    COMPUTED_WAL_DROP_MB=500
-    COMPUTED_QUEUE_MAX_MIB=5120
-    echo "pgbackrest: volume size unknown; using absolute thresholds wal-drop=500 MiB queue-max=5 GiB"
+    COMPUTED_WAL_DROP_MB=$cap_max
+    COMPUTED_QUEUE_MAX_MIB=$cap_max
+    echo "pgbackrest: volume size unknown; using absolute thresholds wal-drop=5 GiB queue-max=5 GiB"
     return
   fi
   total_mib=$(( total_kib / 1024 ))
 
   wal_drop=$(( total_mib / 10 ))
-  [ "$wal_drop" -gt 500 ] && wal_drop=500
+  [ "$wal_drop" -gt "$cap_max" ] && wal_drop=$cap_max
   [ "$wal_drop" -lt 64 ] && wal_drop=64
   COMPUTED_WAL_DROP_MB=$wal_drop
 
-  cap_queue=$(( 5 * 1024 ))
   queue_max=$(( total_mib / 2 ))
-  [ "$queue_max" -gt "$cap_queue" ] && queue_max=$cap_queue
+  [ "$queue_max" -gt "$cap_max" ] && queue_max=$cap_max
   [ "$queue_max" -lt 128 ] && queue_max=128
   COMPUTED_QUEUE_MAX_MIB=$queue_max
 
