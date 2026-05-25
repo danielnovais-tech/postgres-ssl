@@ -347,7 +347,20 @@ t_invalid_bucket_skips_archive() {
       ko t_invalid_bucket_skips_archive "sentinel .pgbackrest_invalid_bucket missing under PGDATA"; fail_dump t_invalid_bucket_skips_archive "$name"; return
     fi
 
-    if ! docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+    # Poll for the validator's guard log line. wait_for_pg returning is
+    # sufficient evidence that postgres + the wrapper-side init script
+    # have both run (validator fires very early, well before postgres
+    # accepts connections), but docker's json-file log driver has been
+    # observed to lag the line a few seconds beyond wait_for_pg under
+    # suite-load. Without this polling loop, the test is a flake.
+    local log_deadline=$(($(date +%s) + 30)) log_hit=0
+    while [ "$(date +%s)" -lt "$log_deadline" ]; do
+      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+        log_hit=1; break
+      fi
+      sleep 1
+    done
+    if [ "$log_hit" != "1" ]; then
       ko t_invalid_bucket_skips_archive "expected guard log line missing for bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return
     fi
 
@@ -629,13 +642,31 @@ setup_pitr_source() {
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  run_archiving_pg "$name" "$vol"
+  # WAL_HEARTBEAT_DISABLED=1: the source cluster doesn't need to keep
+  # emitting heartbeat WAL after the initial setup completes. Without
+  # this, the source's watcher emits pg_logical_emit_message every
+  # poll-interval, archive_timeout=60 forces a segment switch every
+  # minute, and any downstream test that exceeds ~60s between
+  # source_count_before/source_count_after captures sees a false
+  # "leaked write" because the source cluster's own background
+  # archiving advanced the count.
+  run_archiving_pg "$name" "$vol" -e "WAL_HEARTBEAT_DISABLED=1"
   wait_for_pg "$name" >&2 || return 1
   # wait for stanza-create
   for _ in $(seq 1 15); do
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
     sleep 1
   done
+  # Wait for the watcher's NEEDS_INITIAL_BACKUP to land BEFORE the manual
+  # backup + test inserts. Without this guard, the watcher's full and
+  # the manual full race; whichever runs LATER becomes the latest base
+  # for pgbackrest restore. If the watcher wins, its backup_end_lsn is
+  # AFTER the test's target_time, and recovery FATALs with "requested
+  # recovery stop point is before consistent recovery point".
+  wait_for_watcher_backup "$name" full 60 >&2 || {
+    echo "setup_pitr_source: watcher initial full did not land within 60s" >&2
+    return 1
+  }
   docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text, ts timestamptz default now());" >/dev/null
   # Per-cluster path: read the marker so the manual full goes to the same
   # sub-prefix archive_command is pushing to. Restore-side tests read
@@ -2316,10 +2347,11 @@ t_restore_then_wipe_volume_redoes_restore() {
   wait_for_pg "$rest_name" || { ko t_restore_then_wipe_volume_redoes_restore "2nd boot after wipe"; fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"; return; }
 
   # Poll for the restore log line — wrapper writes it before pgbackrest
-  # actually runs, so wait_for_pg returning is sufficient evidence that
-  # the line is in the buffer, but harmless to give it a couple seconds
-  # in case docker's log shipping lags under suite-load.
-  local deadline=$(($(date +%s) + 10)) hit=0
+  # actually runs, so wait_for_pg returning should be sufficient evidence
+  # that the line is in the buffer. Use a generous deadline anyway —
+  # docker's json-file log shipping has been observed to lag a few
+  # seconds beyond wait_for_pg under suite-load on slow runners.
+  local deadline=$(($(date +%s) + 30)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
       hit=1; break
@@ -2517,6 +2549,17 @@ t_restored_marker_persists_across_restarts() {
   replay_staged_count=$(docker logs "$rest_name" 2>&1 | grep -c "PITR replay staged" || true)
   if [ "${replay_staged_count:-0}" -gt 0 ]; then
     ko t_restored_marker_persists_across_restarts "configure_pgbackrest_recovery re-staged on restart; marker not respected (count=$replay_staged_count)"
+    fail_dump t_restored_marker_persists_across_restarts "$rest_name"
+    return
+  fi
+  # /etc/pgbackrest/pgbackrest-recovery-source.conf carries the source
+  # bucket's read credentials. Post-promote, archive_command uses the main
+  # /etc/pgbackrest/pgbackrest.conf — the recovery-source conf is unused.
+  # With .pgbackrest_restored present, configure_pgbackrest_recovery must
+  # NOT rewrite it on every boot; otherwise we leak source creds onto
+  # disk on every restart for no functional benefit.
+  if docker exec "$rest_name" test -f /etc/pgbackrest/pgbackrest-recovery-source.conf; then
+    ko t_restored_marker_persists_across_restarts "pgbackrest-recovery-source.conf rewritten post-promote (marker not gating)"
     fail_dump t_restored_marker_persists_across_restarts "$rest_name"
     return
   fi
@@ -3098,6 +3141,152 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
+# M1. Gap-recovery in progress must suppress periodic-full AND catalog-
+# verify-driven full. Asserts that with the gap marker present, an
+# overdue catalog-verify cycle (interval=5s) doesn't fire a full backup
+# — gap-recovery owns the marker, decide_action stays silent. Without
+# the ordering fix, a verify mid-recovery could see backup.info just
+# rotated by retention and force a full through a wedged S3.
+t_gap_marker_suppresses_catalog_verify_full() {
+  local name=t-gap-verify-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5
+  wait_for_pg "$name" || { ko t_gap_marker_suppresses_catalog_verify_full "startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_gap_marker_suppresses_catalog_verify_full "no initial full"; fail_dump t_gap_marker_suppresses_catalog_verify_full "$name"; return; }
+
+  # Inject the gap marker, then nuke the catalog metadata (simulating a
+  # transient S3 hiccup that reports "no full present" mid-recovery).
+  docker exec -u postgres "$name" touch /var/lib/postgresql/data/.pgbackrest_gap_pending
+  local before_full_count
+  before_full_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+
+  # Wait long enough for several catalog-verify cycles (interval=5s) +
+  # several watcher iterations (POLL=5s) to elapse. ~20s is 4 cycles.
+  sleep 20
+
+  # Critical assertion: no NEW fulls. The marker must have suppressed
+  # both the catalog-verify-clear-state path AND the periodic-full path.
+  local after_full_count
+  after_full_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+  if [ "$after_full_count" -gt "$before_full_count" ]; then
+    ko t_gap_marker_suppresses_catalog_verify_full "watcher took an extra full while gap marker present (before=$before_full_count after=$after_full_count)"
+    fail_dump t_gap_marker_suppresses_catalog_verify_full "$name"
+    return
+  fi
+  # And the marker is still in place (we never let recovery complete).
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_gap_marker_suppresses_catalog_verify_full "gap marker cleared without recovery; test premise broken"
+    return
+  fi
+
+  ok t_gap_marker_suppresses_catalog_verify_full
+  note "gap marker held for ~20s through catalog-verify cycles; no extra full taken"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# L4. .pgbackrest_stanza_create_timeout sentinel must NOT appear after a
+# happy-path boot. The full timeout-then-clear cycle (postgres never
+# reaches pg_isready in 600s → sentinel written → restart with healthy
+# postgres → sentinel cleared) is hard to drive in CI without a 10-min
+# wait, so this test pins the cheap half: a normal boot does not write
+# the sentinel. The cleanup branch is exercised inline in
+# bootstrap_pgbackrest_stanza right after `stanza-create completed`,
+# which has run by the time this test inspects.
+t_stanza_create_timeout_sentinel_absent_on_success() {
+  local name=t-stanza-sentinel-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_stanza_create_timeout_sentinel_absent_on_success "startup"; fail_dump t_stanza_create_timeout_sentinel_absent_on_success "$name"; return; }
+
+  # Wait for stanza-create to complete (with a generous deadline because
+  # initdb + first-boot SQL can stretch this on a busy host).
+  local deadline=$(($(date +%s) + 60)) hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then hit=1; break; fi
+    sleep 1
+  done
+  if [ "$hit" != "1" ]; then
+    ko t_stanza_create_timeout_sentinel_absent_on_success "stanza-create did not complete within deadline"
+    fail_dump t_stanza_create_timeout_sentinel_absent_on_success "$name"
+    return
+  fi
+
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_stanza_create_timeout; then
+    ko t_stanza_create_timeout_sentinel_absent_on_success ".pgbackrest_stanza_create_timeout written on happy-path boot"
+    fail_dump t_stanza_create_timeout_sentinel_absent_on_success "$name"
+    return
+  fi
+
+  ok t_stanza_create_timeout_sentinel_absent_on_success
+  note "no .pgbackrest_stanza_create_timeout sentinel after happy-path boot"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# L7. .pgbackrest_invalid_bucket sentinel is cleared on disable.
+# After a service boots with a junk bucket (sentinel written) and the
+# operator clears the env to disable archiving, the sentinel must not
+# linger on the volume — otherwise the dashboard surfaces "PITR enabled
+# but wired to junk" for a service that's actually in "never enabled"
+# state.
+t_invalid_bucket_sentinel_cleared_on_disable() {
+  local name=t-bad-cleanup-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Phase 1: boot with a UUID-shape bucket (validator rejects it).
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e WAL_ARCHIVE_BUCKET=121ccc45-0912-457e-8dc0-76625fe644bb \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e "WAL_ARCHIVE_KEY=$MINIO_USER" \
+    -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_invalid_bucket_sentinel_cleared_on_disable "phase1 startup"; fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"; return; }
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+    ko t_invalid_bucket_sentinel_cleared_on_disable "phase1 did not write invalid-bucket sentinel"
+    fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"
+    return
+  fi
+
+  # Phase 2: redeploy with no WAL_ARCHIVE_*. clear_pgbackrest_state_if_disabled
+  # must remove the sentinel as part of the WAL_ARCHIVE_BUCKET-unset branch.
+  docker rm -f "$name" >/dev/null
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_invalid_bucket_sentinel_cleared_on_disable "phase2 startup"; fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"; return; }
+
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+    ko t_invalid_bucket_sentinel_cleared_on_disable ".pgbackrest_invalid_bucket survived disable; clear function leaks it"
+    fail_dump t_invalid_bucket_sentinel_cleared_on_disable "$name"
+    return
+  fi
+
+  ok t_invalid_bucket_sentinel_cleared_on_disable
+  note "invalid-bucket sentinel cleared by clear_pgbackrest_state_if_disabled on disable"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -3137,6 +3326,10 @@ ALL_TESTS=(
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
+  # audit follow-ups (M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
+  t_gap_marker_suppresses_catalog_verify_full
+  t_stanza_create_timeout_sentinel_absent_on_success
+  t_invalid_bucket_sentinel_cleared_on_disable
 )
 
 trap 'cleanup_test_resources' EXIT

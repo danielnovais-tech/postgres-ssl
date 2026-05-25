@@ -29,6 +29,31 @@ SSL_DIR="/var/lib/postgresql/data/certs"
 INIT_SSL_SCRIPT="/docker-entrypoint-initdb.d/init-ssl.sh"
 POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 
+# H1 (audit follow-up): clear stale postmaster.pid. wrapper.sh runs once
+# at container start — no postgres has been spawned yet — so any
+# postmaster.pid on disk is from a previous container that didn't get a
+# graceful shutdown (docker rm -f sends SIGKILL; the kernel reaps
+# postgres before it can remove its pid file).
+#
+# Postgres normally self-heals: on start it reads postmaster.pid, calls
+# kill(pid, 0), and removes the file if the PID is dead. The trouble in
+# a container is that postgres ALSO checks if the PID belongs to the
+# same UID — and the watcher's psql/pg_isready subprocesses run as the
+# same postgres UID, so the stale PID number often points at a live
+# (unrelated) watcher subprocess. postgres reads same-UID + alive →
+# concludes "another postmaster is already running" → FATAL.
+#
+# Removing the file unconditionally here is safe because (a) wrapper.sh
+# is the container entrypoint and runs exactly once per container, (b)
+# no postgres process is running at this point, and (c) docker
+# guarantees only one wrapper.sh per container instance. Avoids the
+# need for a graceful-shutdown handoff that re-parents children onto
+# postmaster (postmaster panics with SIGCHLD on unknown children).
+if [ -f "$PGDATA/postmaster.pid" ]; then
+  echo "wrapper: removing stale $PGDATA/postmaster.pid (no postgres running at container start)"
+  rm -f "$PGDATA/postmaster.pid" 2>/dev/null || true
+fi
+
 # Regenerate if the certificate is not a x509v3 certificate
 if [ -f "$SSL_DIR/server.crt" ] && ! openssl x509 -noout -text -in "$SSL_DIR/server.crt" | grep -q "DNS:localhost"; then
   echo "Did not find a x509v3 certificate, regenerating certificates..."
@@ -124,7 +149,9 @@ fi
 # one-time `include_dir = 'conf.d'` directive is durable; from then on,
 # enable/disable is just write/remove of conf.d/pgbackrest.conf. conf.d
 # loads before auto.conf so a determined operator's `ALTER SYSTEM SET
-# archive_mode = 'off'` still wins; the dashboard surfaces the divergence
+# archive_mode = 'off'` (or `ALTER SYSTEM SET track_commit_timestamp = 'off'`,
+# which silently degrades the PITR picker's `recovery_target_time` ceiling
+# to lastArchivedAt) still wins; the dashboard surfaces the divergence
 # from the image's intended state by reading pg_settings.
 #
 # pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
@@ -217,13 +244,21 @@ validate_wal_archive_bucket() {
     *'${{'*|*'}}'*) invalid="unresolved-template-ref" ;;
     *[[:space:]]*) invalid="whitespace" ;;
   esac
+  # UUID-shape rejection: catches Railway internal bucket-id leaks from a
+  # failed resolver. WAL_ARCHIVE_BUCKET_ALLOW_UUID=1 is the escape hatch for
+  # the rare customer who legitimately uses a UUID-named bucket.
   if [ -z "$invalid" ] \
+    && [ "${WAL_ARCHIVE_BUCKET_ALLOW_UUID:-0}" != "1" ] \
     && echo "$val" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     invalid="uuid-shape"
   fi
 
   if [ -n "$invalid" ]; then
-    echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (${invalid}); refusing to enable archiving" >&2
+    if [ "$invalid" = "uuid-shape" ]; then
+      echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (uuid-shape); refusing to enable archiving. If this UUID is your legitimate bucket name, set WAL_ARCHIVE_BUCKET_ALLOW_UUID=1 to override." >&2
+    else
+      echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (${invalid}); refusing to enable archiving" >&2
+    fi
     # Export so pgbackrest-init.sh can write the sentinel during initdb.
     # Writing to PGDATA here would break initdb on a fresh volume:
     # docker-entrypoint.sh skips initdb when `ls -A "$PGDATA"` is non-empty,
@@ -554,6 +589,21 @@ clear_pgbackrest_state_if_disabled() {
     # from NEEDS_INITIAL_BACKUP rather than a stale "last full was X" cache.
     [ -f "$PGDATA/.pgbackrest_backup_state" ] && rm -f "$PGDATA/.pgbackrest_backup_state" && removed=1
     [ -f "$PGDATA/.pgbackrest_gap_pending" ] && rm -f "$PGDATA/.pgbackrest_gap_pending" && removed=1
+    # Stanza-create timeout sentinel is scoped to the configured archive
+    # bucket; clear it so the dashboard doesn't surface "stanza
+    # bootstrap timed out" against a service whose archive is now off.
+    [ -f "$PGDATA/.pgbackrest_stanza_create_timeout" ] && rm -f "$PGDATA/.pgbackrest_stanza_create_timeout" && removed=1
+    #
+    # Intentionally NOT clearing $PGBACKREST_INVALID_BUCKET_MARKER here:
+    # validate_wal_archive_bucket unsets WAL_ARCHIVE_BUCKET on rejection,
+    # which makes this function see "archive disabled" and would
+    # race-delete the sentinel that pgbackrest-init.sh (initdb hook) or
+    # validate_wal_archive_bucket itself (existing-volume path) just
+    # wrote. The validator handles the sentinel lifecycle: pgbackrest-init.sh
+    # writes on a true rejection during initdb; validate_wal_archive_bucket
+    # itself rm's stale sentinels at the top of every boot when
+    # WAL_ARCHIVE_BUCKET is unset. Letting them own that file
+    # end-to-end avoids the self-overwrite.
   fi
   if [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
@@ -607,6 +657,12 @@ bootstrap_pgbackrest_stanza() {
     until pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; do
       if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "pgbackrest: timed out waiting for Postgres before stanza-create" >&2
+        # Drop a sentinel so the monitor can distinguish "stanza bootstrap
+        # timed out" from "archiving was never enabled" — the latter has
+        # no archive_command set; the former has archive_command set but
+        # no stanza in the bucket. Cleared on success below + by
+        # clear_pgbackrest_state_if_disabled on archive disable.
+        touch "$PGDATA/.pgbackrest_stanza_create_timeout" 2>/dev/null || true
         exit 1
       fi
       sleep 2
@@ -634,6 +690,12 @@ bootstrap_pgbackrest_stanza() {
     while true; do
       if gosu postgres pgbackrest --stanza=main stanza-create; then
         echo "pgbackrest: stanza-create completed"
+        # Clear the timeout sentinel — a successful stanza-create either
+        # arrived inside the deadline (no sentinel) or after a previous
+        # boot's timeout (stale sentinel from disk). Either way, the
+        # current state is "stanza present" and the dashboard should
+        # treat the timeout as resolved.
+        rm -f "$PGDATA/.pgbackrest_stanza_create_timeout" 2>/dev/null || true
         break
       fi
       echo "pgbackrest: stanza-create failed, retrying in 30s..." >&2
@@ -668,6 +730,17 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # Recovery already done on this volume: skip both the conf write AND the
+  # staging path. Post-promote services have $PGBACKREST_RESTORED_MARKER
+  # (empty-volume restore handed off its own recovery params) or
+  # $PITR_DONE_MARKER (post-promote, picker-routed cleanup already ran).
+  # Rewriting the source-bucket creds on every boot of a long-promoted
+  # service leaks them onto disk for no functional benefit — archive_command
+  # uses the default conf, not this one, post-promote.
+  if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ]; then
+    return 0
+  fi
+
   # /etc/pgbackrest is rebuilt on every boot, so always re-render the
   # recovery conf when WAL_RECOVER_FROM_* is set — postgres' restore_command
   # references it whether the auto.conf was written by the wrapper's own
@@ -694,17 +767,9 @@ EOF
   chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
   chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
 
-  # The pgbackrest-restore path (empty-volume restore) handles recovery
-  # staging itself — recovery.signal + recovery params come out of
-  # `pgbackrest restore`, not our conf.d include. Skip the include-write
-  # path so we don't end up with duplicate recovery_target_time settings.
-  if [ -f "$PGBACKREST_RESTORED_MARKER" ]; then
-    return 0
-  fi
-
-  if [ -f "$PITR_DONE_MARKER" ]; then
-    return 0
-  fi
+  # PGBACKREST_RESTORED_MARKER / PITR_DONE_MARKER short-circuited above, so
+  # the only paths reaching here are (a) first-time staging or (b) the
+  # post-promote cleanup branch below.
 
   if [ -f "$PITR_STAGING_FILE" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
     rm -f "$PITR_STAGING_FILE"
@@ -759,17 +824,38 @@ EOF
 # stay out of the way (its conf.d include would duplicate what pgbackrest
 # restore already wrote).
 #
-# Container restart on an already-restored volume: $PGDATA is populated, so
-# the empty-PGDATA gate fails and we skip — Postgres starts normally.
+# Container restart on an already-restored volume: `.pgbackrest_restored`
+# present → skip.
+#
+# Container restart on an externally-restored volume (e2e helper
+# pgbackrest_restore_into pre-populated PGDATA; operator ran their own
+# `pgbackrest restore` and brought the cluster up): PG_VERSION and
+# pg_control both present, `.pgbackrest_restored` absent. We do NOT
+# touch this volume — configure_pgbackrest_recovery handles staging.
+# (We can't write a private in-progress marker into PGDATA before
+# invoking pgbackrest, because pgbackrest then sees PGDATA as non-empty
+# without PG_VERSION/backup.manifest, disables --delta, and aborts.)
+#
+# Container kill mid-restore (the M2 audit case): pgbackrest restore
+# writes pg_control LAST (the upstream design specifically guarantees
+# this: "performed last to ensure aborted restores cannot be started").
+# So PG_VERSION present + pg_control absent = partial restore. Re-run
+# pgbackrest with `--delta`: by this point backup.manifest is on disk,
+# so pgbackrest accepts --delta and checksum-diffs the partial PGDATA
+# against the base, only refetching what's missing.
 restore_from_pgbackrest_if_empty_volume() {
   # Log gate state up front so post-mortems on "why did pgbackrest restore
   # run when I expected it to be skipped" don't require guessing.
-  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) PG_CONTROL=$([ -f "$PGDATA/global/pg_control" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
 
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
-  [ -f "$PGDATA/PG_VERSION" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
+  # PG_VERSION + pg_control both present = completed external restore.
+  # Skip; configure_pgbackrest_recovery handles staging.
+  if [ -f "$PGDATA/PG_VERSION" ] && [ -f "$PGDATA/global/pg_control" ]; then
+    return 0
+  fi
 
   echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 
@@ -832,11 +918,20 @@ EOF
 
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
+  #
+  # --delta makes pgbackrest checksum-diff $PGDATA against the base
+  # manifest and refetch only the files that differ. On a fresh-volume
+  # restore pgbackrest disables --delta itself (no PG_VERSION /
+  # backup.manifest yet — full restore is the only sane option anyway).
+  # On a partial-PGDATA retry (container killed mid-restore: PGDATA has
+  # PG_VERSION + backup.manifest but no pg_control), pgbackrest accepts
+  # --delta and repairs in place. Mirrors postgres-ssl audit M2.
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
        --stanza=main \
        --pg1-path="$PGDATA" \
        --recovery-option=restore_command="$recovery_restore_cmd" \
        restore \
+       --delta \
        --type="$restore_type" --target="$restore_target" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
@@ -845,6 +940,18 @@ EOF
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
+
+  # pgbackrest restore copies ALL of PGDATA — including the source's
+  # watcher state (`.pgbackrest_backup_state` with source's last_full_at,
+  # last_full_failed_count) and any in-flight gap-recovery marker. On
+  # the fork's own bucket those values are meaningless and they cause
+  # the watcher to mis-detect: source's last_full_at makes
+  # NEEDS_INITIAL_BACKUP skip even though the fork's bucket is empty,
+  # while source's last_full_failed_count vs fork's fresh failed_count
+  # triggers a phantom gap-recovery cycle that blocks the watcher's
+  # actual first full. Wipe so the fork starts from a clean slate.
+  rm -f "$PGDATA/.pgbackrest_backup_state" 2>/dev/null || true
+  rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
 
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
@@ -932,7 +1039,38 @@ fi
 unset PGHOST
 unset PGPORT
 
+# Write the per-cluster repo-path marker synchronously when archive is on
+# and the cluster is already initialized (pg_control on disk). Without this,
+# the first archive_command on an existing volume that's enabling PITR for
+# the first time races bootstrap_pgbackrest_stanza's async marker write:
+# postmaster fires archive-push as soon as the first WAL switch occurs
+# (≤archive_timeout=60s), but the bootstrap subshell can't write the marker
+# until pg_isready succeeds — and on an active DB the first archive-push
+# can land first, pushing to the bucket root instead of cluster-<sysid>/.
+# pgbackrest-init.sh covers the fresh-init path during initdb (pg_control
+# is materialized then); this covers the existing-volume first-enable path.
+if [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ -f "$PGDATA/global/pg_control" ] && [ ! -f "$PGBACKREST_REPO_PATH_MARKER" ]; then
+  _early_repo_path=$(derive_pgbackrest_repo_path)
+  echo "pgbackrest: pre-fork repo-path marker = ${_early_repo_path}"
+  unset _early_repo_path
+fi
+
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 
+# H1 (audit): we considered `exec docker-entrypoint.sh` and a
+# trap+wait+forward-SIGTERM pattern to make `docker stop` flush
+# postgres's graceful shutdown sequence and clear postmaster.pid.
+# Neither survived CI: exec re-parents the watcher/bootstrap subshells
+# onto postmaster (postmaster panics on SIGCHLD with exit 103); the
+# trap+wait pattern disturbed docker-entrypoint's initdb-time temp
+# postmaster lifecycle and broke `docker restart` (auto.conf changes
+# didn't survive). The real production failure mode the audit named —
+# stale postmaster.pid colliding with a recently-respawned watcher PID —
+# is already mitigated by PR #86 reverting the wrapper.sh supervisor:
+# the watcher's long-lived PID no longer churns, so the in-container
+# kill(stale_pid, 0) liveness check no longer hits one of its
+# subprocesses. Falling back to the simple foreground invocation
+# preserves the e2e suite's existing behavior on docker stop / docker
+# restart.
 /usr/local/bin/docker-entrypoint.sh "$@"
