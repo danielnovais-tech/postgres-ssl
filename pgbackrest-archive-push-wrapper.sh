@@ -86,6 +86,17 @@ if [ "$PGB_RC" -eq 0 ]; then
   exit 0
 fi
 
+# In async mode the foreground output above is brief (just "command begin").
+# The async worker writes the real error (HTTP response, S3 error code, etc.)
+# to a spool status file. Print it so the actual failure reason appears in
+# deployment logs instead of being invisible.
+WAL_BASENAME=$(basename "$WAL_FILE")
+SPOOL_ERR="${PGDATA}/pgbackrest-spool/archive/main/in/${WAL_BASENAME}.error"
+if [ -f "$SPOOL_ERR" ]; then
+  printf 'pgbackrest-wrapper: async spool error for %s (rc=%s):\n' "$WAL_BASENAME" "$PGB_RC" >&2
+  cat "$SPOOL_ERR" >&2
+fi
+
 # Bucket deleted: when the bucket no longer exists Tigris returns NoSuchBucket
 # on read paths, but validates credentials before checking bucket existence on
 # write paths (archive-push is a PUT). Railway revokes the bucket credentials
