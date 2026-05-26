@@ -77,6 +77,17 @@ set -u
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 STATE_FILE="$PGDATA/.pgbackrest_backup_state"
 GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
+PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
+SPOOL_ERR_DIR="$PGDATA/pgbackrest-spool/archive/main/in"
+
+# Patroni REST API for HA clusters. In postgres-ha the API is up before
+# postgres accepts queries; in standalone postgres-ssl nothing listens on
+# 8008 and the patroni_* helpers short-circuit to no-op. Custom top-level
+# keys in /config are stored verbatim and broadcast to every node via DCS;
+# we use this as the cluster-wide active-archive-path source-of-truth so
+# a post-promotion leader doesn't restart archiving at the stale marker
+# inherited from its basebackup.
+PATRONI_API="${PATRONI_RESTAPI_URL:-http://127.0.0.1:8008}"
 
 # POLL_INTERVAL_SECONDS / GAP_RECOVERY_BACKOFF_SECONDS are env-overridable so
 # the e2e harness can exercise gap-recovery in <1 min instead of 10+. The
@@ -405,6 +416,80 @@ kick_async_daemon() {
   pkill -f 'archive-push:async' 2>/dev/null || true
 }
 
+# Source-of-truth setter for the active archive path. Updates the on-disk
+# marker (read by archive-push wrapper on every call and by the watcher's
+# sync_repo_path_from_marker), rewrites repo1-path in /etc/pgbackrest/pgbackrest.conf
+# (read by SSH-driven `pgbackrest info` from mono's restore picker, which
+# doesn't source the watcher's env), and updates the process env. Idempotent.
+apply_active_path() {
+  local path="$1"
+  [ -z "$path" ] && return 1
+  echo "$path" > "$PGDATA/.pgbackrest_repo_path"
+  if [ -f "$PGBACKREST_CONF_FILE" ]; then
+    sed -i "s|^repo1-path=.*|repo1-path=${path}|" "$PGBACKREST_CONF_FILE"
+  fi
+  PGBACKREST_REPO1_PATH="$path"
+  export PGBACKREST_REPO1_PATH
+}
+
+# Patroni availability probe. 2s timeout keeps the watcher loop snappy on
+# standalone postgres-ssl where nothing answers on 8008.
+patroni_available() {
+  curl -sf -o /dev/null --max-time 2 "${PATRONI_API}/" 2>/dev/null
+}
+
+# Adopt the cluster-wide active path from Patroni DCS. Called near the top
+# of each leader iteration; after a leader handoff this catches a stale
+# .pgbackrest_repo_path inherited from basebackup before any archive
+# activity routes to the wrong prefix.
+sync_active_path_from_patroni() {
+  patroni_available || return 0
+  local dcs_path
+  dcs_path=$(curl -sf --max-time 5 "${PATRONI_API}/config" 2>/dev/null \
+    | jq -r '.rwy_active_archive_path // empty' 2>/dev/null) || return 0
+  [ -z "$dcs_path" ] && return 0
+  if [ "$dcs_path" != "$PGBACKREST_REPO1_PATH" ]; then
+    log "active-path: adopting ${dcs_path} from Patroni DCS (was ${PGBACKREST_REPO1_PATH:-unset})"
+    apply_active_path "$dcs_path"
+  fi
+}
+
+# Broadcast the freshly-chosen active path to Patroni DCS. PATCH /config
+# with a custom top-level key — Patroni stores and propagates to every
+# node via etcd/Consul/k8s without acting on the key itself. Failure is
+# logged, not fatal; the migration's own state machine keeps re-firing
+# until a future iteration's publish succeeds.
+publish_active_path_to_patroni() {
+  patroni_available || return 0
+  local path="$1"
+  curl -sf -X PATCH --max-time 5 \
+    -H 'Content-Type: application/json' \
+    -d "{\"rwy_active_archive_path\":\"${path}\"}" \
+    "${PATRONI_API}/config" >/dev/null 2>&1 \
+    || log "patroni: failed to publish active path (will re-assert next iteration)"
+}
+
+# Async-spool probe for ArchiveDuplicateError (exit 45). Catches the case
+# where async hit the regression but the foreground archive_command hasn't
+# yet been re-invoked to surface .error to pg_stat_archiver — so
+# LAST_FAILED_WAL is still NULL/stale and the failed_grew + epoch guards
+# below can't fire. Echoes the WAL filename of the first matching error;
+# returns non-zero if none found. Pattern set is pgBackRest 2.x — the
+# integer exit-code line is the most version-stable of the three.
+probe_async_duplicate_error() {
+  [ -d "$SPOOL_ERR_DIR" ] || return 1
+  local err_file
+  for err_file in "$SPOOL_ERR_DIR"/*.error; do
+    [ -f "$err_file" ] || continue
+    if grep -qE 'ArchiveDuplicateError|exit code: ?45|already exists in the (archive|repo).*different' \
+       "$err_file" 2>/dev/null; then
+      basename "$err_file" .error
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
 # path suffix (e.g. cluster-SYSID → cluster-SYSID-<epoch>). WAL_REGRESSION
 # occurs when a volume snapshot rollback restores the data directory to an
@@ -412,10 +497,16 @@ kick_async_daemon() {
 # pgBackRest refuses to overwrite existing S3 objects with different content
 # (exit 45) so every archive-push fails — pkill-async cycles do not fix this.
 #
-# The migration is non-destructive: the old path and all its backups remain in
-# S3 untouched. Both the archive-push wrapper and this watcher re-read
-# .pgbackrest_repo_path on every call/iteration, so writing the new path there
-# takes effect immediately without a redeploy.
+# The migration is non-destructive: the old path and all its backups remain
+# in S3 untouched. Effective immediately without a redeploy because three
+# read paths all converge on the new path in lockstep:
+#   - archive-push wrapper + this watcher re-read .pgbackrest_repo_path
+#   - mono's SSH-driven `pgbackrest info` (restore picker) reads repo1-path
+#     from /etc/pgbackrest/pgbackrest.conf — rewritten by apply_active_path
+#   - HA replicas adopt via Patroni DCS — publish_active_path_to_patroni
+#     PATCHes /config so a post-promotion leader sees the new path on its
+#     first iteration instead of restarting at the original cluster-SYSID
+#     and re-firing migration with a different epoch suffix
 #
 # Suffix is the wall-clock epoch at migration time, not an incrementing
 # generation counter. A counter lives in PGDATA's state file — a second
@@ -463,11 +554,23 @@ migrate_to_new_archive_path() {
   write_state_field last_force_recovery_at 0
   write_state_field force_attempts 0
 
-  # Commit point: once the marker is on disk, archive-push and the next
-  # watcher iteration target the new path.
-  echo "$new_path" > "$PGDATA/.pgbackrest_repo_path"
-  PGBACKREST_REPO1_PATH="$new_path"
-  export PGBACKREST_REPO1_PATH
+  # Commit point: marker + conf + env in lockstep. SSH-driven `pgbackrest
+  # info` from mono's restore picker reads the conf, not the marker, so a
+  # conf that lags the marker would leave the restore UI invisible to the
+  # new path until the next container redeploy. Patroni DCS broadcast lets
+  # a post-promotion leader adopt this path on its first iteration instead
+  # of restarting at the original cluster-SYSID and re-firing migration
+  # with a different epoch suffix (orphaning the in-flight prefix).
+  apply_active_path "$new_path"
+  publish_active_path_to_patroni "$new_path"
+
+  # Stale .error files in the async spool reference segments on the OLD
+  # path — the conflict that produced them doesn't exist at the new
+  # (empty) path. Without cleanup the next iteration's
+  # probe_async_duplicate_error would re-fire migration on leftovers.
+  # The spool is a coordination cache, never durable data — async
+  # re-uploads from pg_wal on next call.
+  rm -f "$SPOOL_ERR_DIR"/*.error 2>/dev/null || true
 
   # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
   # GAP_MARKER gate in decide_action, so its presence here wouldn't block
@@ -514,6 +617,27 @@ gap_recovery_step() {
     fi
   fi
   LAST_OBSERVED_LAG_SEGMENTS="$lag"
+
+  # Async-spool probe runs before any of the foreground-signal branches.
+  # pgBackRest async writes a .error file when push fails; the foreground
+  # only surfaces that error to pg_stat_archiver on the next archive_command
+  # invocation. On a quiet DB the next invocation may be a long way off, and
+  # without a foreground-side failure LAST_FAILED_WAL is NULL and the
+  # downstream regression detection can't fire. Read the spool directly so
+  # an async-only wedge converges in one poll cycle. Same predicate
+  # semantics: same timeline, failed segment ≤ catalog max.
+  local dup_seg
+  if dup_seg=$(probe_async_duplicate_error) && [ -n "$catalog_max" ] && [ -n "$dup_seg" ]; then
+    local d_tl c_tl d_n c_n
+    d_tl="${dup_seg:0:8}"; c_tl="${catalog_max:0:8}"
+    d_n=$(segment_to_number "$dup_seg"); c_n=$(segment_to_number "$catalog_max")
+    if [ "$d_tl" = "$c_tl" ] && [ -n "$d_n" ] && [ -n "$c_n" ] && [ "$d_n" -le "$c_n" ]; then
+      GAP_STATE_DIAG="wal-regression"
+      log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max}) — self-healing"
+      migrate_to_new_archive_path
+      return 0
+    fi
+  fi
 
   # In recovery? Marker is the truth — either we set it on a previous lag
   # detection or the archive-push wrapper touched it on a hard failure.
@@ -804,6 +928,13 @@ watcher_iteration() {
     log "iteration skipped: standby"
     return 0
   fi
+
+  # Adopt the cluster-wide active path from Patroni DCS before any archive
+  # activity. On the very first iteration after a leader handoff this picks
+  # up a path the prior leader wrote at migration time but that this node's
+  # local .pgbackrest_repo_path (inherited from basebackup) doesn't reflect.
+  # No-op on standalone postgres-ssl (port 8008 not listening).
+  sync_active_path_from_patroni
 
   emit_wal_heartbeat
 
