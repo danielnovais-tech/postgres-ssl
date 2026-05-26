@@ -61,6 +61,25 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+
+# Defensive gate: if WAL_ARCHIVE_BUCKET is unset or empty at the time
+# archive_command fires, archiving is not configured for this service.
+# The normal path is wrapper.sh's clear_pgbackrest_state_if_disabled
+# removing $PGDATA/conf.d/pgbackrest.conf so postgres never picks up
+# archive_command in the first place — but a redeploy that didn't run,
+# pinning to an older postgres-ssl tag that predates the cleanup, or a
+# leftover ALTER SYSTEM SET archive_command in postgresql.auto.conf can
+# all leak the archive_command setting onto a postgres that has no
+# bucket. Surfacing pgbackrest's FileMissingError (exit 103) to Postgres
+# in that state produces tens of thousands of "archive_command failed"
+# lines a day for a service whose PITR is intentionally off. Return 0
+# so pg_wal recycles; the log line below is the only signal admins need
+# to clear the stale config (redeploy, or unset archive_command).
+if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
+  echo "pgbackrest-wrapper: WAL_ARCHIVE_BUCKET is unset; archive_command should not be installed. Dropping ${WAL_FILE} to keep Postgres up — redeploy the service so wrapper.sh can clean up the stale conf, or update the source image if a redeploy doesn't fix it." >&2
+  exit 0
+fi
+
 PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-500}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
