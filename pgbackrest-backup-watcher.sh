@@ -406,27 +406,36 @@ kick_async_daemon() {
 }
 
 # Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
-# path suffix (e.g. cluster-SYSID → cluster-SYSID-2). WAL_REGRESSION occurs
-# when a volume snapshot rollback restores the data directory to an earlier LSN
-# while S3 retains the pre-rollback WAL at the same segment names. pgBackRest
-# refuses to overwrite existing S3 objects with different content (exit 45) so
-# every archive-push fails — pkill-async cycles do not fix this.
+# path suffix (e.g. cluster-SYSID → cluster-SYSID-<epoch>). WAL_REGRESSION
+# occurs when a volume snapshot rollback restores the data directory to an
+# earlier LSN while S3 retains the pre-rollback WAL at the same segment names.
+# pgBackRest refuses to overwrite existing S3 objects with different content
+# (exit 45) so every archive-push fails — pkill-async cycles do not fix this.
 #
 # The migration is non-destructive: the old path and all its backups remain in
 # S3 untouched. Both the archive-push wrapper and this watcher re-read
 # .pgbackrest_repo_path on every call/iteration, so writing the new path there
 # takes effect immediately without a redeploy.
 #
-# After writing the new path, all backup state is reset so the next iteration
-# enters NEEDS_INITIAL_BACKUP and triggers the stanza-create + full backup via
-# the standard run_backup path (exit 55 → stanza-create → retry). Clearing
-# GAP_MARKER here is required — decide_action skips all action while the
-# marker is set, which would create a chicken-and-egg with the new stanza.
+# Suffix is the wall-clock epoch at migration time, not an incrementing
+# generation counter. A counter lives in PGDATA's state file — a second
+# volume-snapshot rollback to a pre-self-heal PGDATA would reset the counter
+# to 0 and re-pick the same `-2` suffix as a prior migration, colliding with
+# the still-broken contents at that path. Epoch-suffixed paths are unique
+# across rollbacks for as long as wall-clock advances.
+#
+# Crash safety: state-reset writes land BEFORE the marker flip. A crash in
+# the middle leaves marker=OLD + last_full_at="" — the next iteration
+# re-detects WAL_REGRESSION at the old path and re-fires this function with
+# a fresh epoch, converging cleanly. The alternative (marker first) would
+# strand the watcher at the new empty path with stale last_full_at, skipping
+# NEEDS_INITIAL_BACKUP and waiting up to a full catalog-verify cycle to heal.
 migrate_to_new_archive_path() {
   local old_path="${PGBACKREST_REPO1_PATH}"
 
-  # Store the original (gen 0) path once so successive migrations produce
-  # -2, -3, … instead of chaining suffixes like -2-2.
+  # Track the pre-migration path so successive migrations land at
+  # cluster-SYSID-<epoch1>, cluster-SYSID-<epoch2>, … rather than chaining
+  # suffixes (cluster-SYSID-<epoch1>-<epoch2>).
   local orig_path
   orig_path=$(read_state wal_regression_orig_path)
   if [ -z "$orig_path" ]; then
@@ -434,29 +443,35 @@ migrate_to_new_archive_path() {
     write_state_field wal_regression_orig_path "$orig_path"
   fi
 
-  local gen
-  gen=$(read_state wal_regression_gen); : "${gen:=0}"
-  gen=$((gen + 1))
-  write_state_field wal_regression_gen "$gen"
-
-  # Suffix: gen=1 → -2, gen=2 → -3, etc.
-  local new_path="${orig_path}-$((gen + 1))"
+  local new_path="${orig_path}-$(date +%s)"
 
   log "wal-regression: migrating archive path (${old_path} → ${new_path}); old backups preserved at former path"
 
-  printf '%s' "$new_path" > "$PGDATA/.pgbackrest_repo_path"
-  PGBACKREST_REPO1_PATH="$new_path"
-  export PGBACKREST_REPO1_PATH
-
-  # Reset all backup state so the next iteration enters NEEDS_INITIAL_BACKUP
-  # at the new path. GAP_MARKER cleared so decide_action is unblocked.
+  # Reset backup-tracking + recovery state BEFORE flipping the marker. If
+  # this function is interrupted partway through, the next iteration sees
+  # marker=OLD with last_full_at="" and re-fires migrate (with a fresh
+  # epoch suffix) instead of getting stuck at a half-migrated state.
+  # Refresh stats so last_full_failed_count anchors at the current failed
+  # count — matches clear_gap_recovery_state's semantics so a re-detection
+  # immediately after migrate doesn't trip on a stale 0 anchor.
+  refresh_archiver_stats || true
+  write_state_field last_full_failed_count "${FAILED_COUNT:-0}"
   write_state_field last_full_at ""
   write_state_field last_diff_at ""
-  write_state_field last_full_failed_count 0
   write_state_field last_lag_detected_at 0
   write_state_field catalog_max_at_detection ""
   write_state_field last_force_recovery_at 0
   write_state_field force_attempts 0
+
+  # Commit point: once the marker is on disk, archive-push and the next
+  # watcher iteration target the new path.
+  echo "$new_path" > "$PGDATA/.pgbackrest_repo_path"
+  PGBACKREST_REPO1_PATH="$new_path"
+  export PGBACKREST_REPO1_PATH
+
+  # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
+  # GAP_MARKER gate in decide_action, so its presence here wouldn't block
+  # the post-migrate full — removing it is purely tidiness.
   rm -f "$GAP_MARKER"
 
   log "wal-regression: state reset; next iteration will initialize stanza and take full backup at ${new_path}"
@@ -554,10 +569,13 @@ gap_recovery_step() {
 
     if [ "$since_action" -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ]; then
       # Escape hatch: after ≥2 pkill cycles with no catalog advance, check
-      # whether this is a WAL_REGRESSION. If last_failed_wal is behind the
-      # catalog max on the same timeline, pkill-async cannot fix the conflict
-      # (the issue is structural — pgBackRest refuses to overwrite existing
-      # S3 objects with different content after a data-dir rollback).
+      # whether this is a WAL_REGRESSION. If last_failed_wal is at or before
+      # the catalog max on the same timeline, pkill-async cannot fix the
+      # conflict (the issue is structural — pgBackRest refuses to overwrite
+      # existing S3 objects with different content after a data-dir rollback).
+      # `-le` (not `-lt`) covers the boundary case where rollback lands
+      # exactly at the last successfully archived segment and postgres
+      # re-pushes that same segment number with different content.
       if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
          && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
         local wr_ftl wr_ctlmax_tl
@@ -567,7 +585,7 @@ gap_recovery_step() {
           local wr_f_n wr_c_n
           wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
           wr_c_n=$(segment_to_number "$catalog_max")
-          if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -lt "$wr_c_n" ]; then
+          if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
             GAP_STATE_DIAG="wal-regression"
             log "wal-regression: detected after ${force_attempts} pkill attempts (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}) — self-healing"
             migrate_to_new_archive_path
@@ -606,11 +624,13 @@ gap_recovery_step() {
 
   if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
     # Before entering the pkill-cycle state machine, check whether this is a
-    # WAL_REGRESSION: last_failed_wal is behind the catalog max on the same
-    # timeline, meaning pgBackRest is refusing to overwrite existing S3 objects
-    # with different content (exit 45). pkill-async cannot fix this — it is a
-    # structural archive conflict, not a stuck process. Self-heal immediately
-    # by migrating to a new archive path suffix.
+    # WAL_REGRESSION: last_failed_wal is at or before the catalog max on the
+    # same timeline, meaning pgBackRest is refusing to overwrite existing S3
+    # objects with different content (exit 45). pkill-async cannot fix this —
+    # it is a structural archive conflict, not a stuck process. Self-heal
+    # immediately by migrating to a new archive path suffix. `-le` (not `-lt`)
+    # covers the boundary case where rollback lands exactly at the last
+    # archived segment.
     #
     # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
     # currently active, not a stale pg_stat_archiver.last_failed_wal from an
@@ -624,7 +644,7 @@ gap_recovery_step() {
         local wr_f_n wr_c_n
         wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
         wr_c_n=$(segment_to_number "$catalog_max")
-        if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -lt "$wr_c_n" ]; then
+        if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
           GAP_STATE_DIAG="wal-regression"
           log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
           migrate_to_new_archive_path
