@@ -408,10 +408,17 @@ kick_async_daemon() {
 }
 
 # Source-of-truth setter for the active archive path. Updates the on-disk
-# marker (read by archive-push wrapper on every call and by the watcher's
-# sync_repo_path_from_marker), rewrites repo1-path in /etc/pgbackrest/pgbackrest.conf
-# (read by SSH-driven `pgbackrest info` from mono's restore picker, which
-# doesn't source the watcher's env), and updates the process env. Idempotent.
+# marker (read by the archive-push wrapper on every call and by the watcher's
+# sync_repo_path_from_marker), rewrites repo1-path in
+# /etc/pgbackrest/pgbackrest.conf, and updates the process env. Idempotent.
+#
+# The conf rewrite is defense-in-depth, not the load-bearing read path:
+# mono's restore-picker SSH probe (packages/backboard/src/controllers/databases/
+# pgbackrestInfo.ts) reads the marker via `cat $PGDATA/.pgbackrest_repo_path`
+# and exports PGBACKREST_REPO1_PATH as an env override, and env > conf in
+# pgBackRest's option resolution. Marker-flip alone is what the picker sees.
+# The conf rewrite catches bare `pgbackrest info` invocations that don't go
+# through the override — operator `docker exec` shells, future callers, etc.
 apply_active_path() {
   local path="$1"
   [ -z "$path" ] && return 1
@@ -452,11 +459,21 @@ probe_async_duplicate_error() {
 # (exit 45) so every archive-push fails — pkill-async cycles do not fix this.
 #
 # The migration is non-destructive: the old path and all its backups remain
-# in S3 untouched. Effective immediately without a redeploy because both
-# read paths converge on the new path in lockstep:
-#   - archive-push wrapper + this watcher re-read .pgbackrest_repo_path
-#   - mono's SSH-driven `pgbackrest info` (restore picker) reads repo1-path
-#     from /etc/pgbackrest/pgbackrest.conf — rewritten by apply_active_path
+# in S3 untouched and remain reachable through mono's PITR restore UI —
+# usePitrHistories.tsx discovers every cluster-* sub-prefix in the bucket
+# and offers each as a selectable restore source (`isCurrent` flag
+# distinguishes the active path from orphans), so a customer can still
+# PITR off the pre-rollback path if they want. No customer-side action is
+# required to keep that data reachable.
+#
+# Effective immediately without a redeploy because every read path converges
+# on the new path in lockstep:
+#   - archive-push wrapper + this watcher re-read .pgbackrest_repo_path on
+#     every call/iteration
+#   - mono's SSH probe reads the marker first and exports
+#     PGBACKREST_REPO1_PATH (env > conf), so the picker sees the new path
+#     the moment the marker flips
+#   - /etc/pgbackrest/pgbackrest.conf is rewritten for bare-shell diagnostics
 #
 # Suffix is the wall-clock epoch at migration time, not an incrementing
 # generation counter. A counter lives in PGDATA's state file — a second
@@ -504,10 +521,10 @@ migrate_to_new_archive_path() {
   write_state_field last_force_recovery_at 0
   write_state_field force_attempts 0
 
-  # Commit point: marker + conf + env in lockstep. SSH-driven `pgbackrest
-  # info` from mono's restore picker reads the conf, not the marker, so a
-  # conf that lags the marker would leave the restore UI invisible to the
-  # new path until the next container redeploy.
+  # Commit point: marker + conf + env in lockstep. Marker-flip is what
+  # mono's restore picker actually reads (it inspects the marker and
+  # exports PGBACKREST_REPO1_PATH for its `pgbackrest info` calls); the
+  # conf rewrite is defense-in-depth for bare-shell diagnostics.
   apply_active_path "$new_path"
 
   # Stale .error files in the async spool reference segments on the OLD
