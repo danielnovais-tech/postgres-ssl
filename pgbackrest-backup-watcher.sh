@@ -80,15 +80,6 @@ GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
 SPOOL_ERR_DIR="$PGDATA/pgbackrest-spool/archive/main/in"
 
-# Patroni REST API for HA clusters. In postgres-ha the API is up before
-# postgres accepts queries; in standalone postgres-ssl nothing listens on
-# 8008 and the patroni_* helpers short-circuit to no-op. Custom top-level
-# keys in /config are stored verbatim and broadcast to every node via DCS;
-# we use this as the cluster-wide active-archive-path source-of-truth so
-# a post-promotion leader doesn't restart archiving at the stale marker
-# inherited from its basebackup.
-PATRONI_API="${PATRONI_RESTAPI_URL:-http://127.0.0.1:8008}"
-
 # POLL_INTERVAL_SECONDS / GAP_RECOVERY_BACKOFF_SECONDS are env-overridable so
 # the e2e harness can exercise gap-recovery in <1 min instead of 10+. The
 # defaults are conservative; nothing user-facing advertises these knobs.
@@ -432,43 +423,6 @@ apply_active_path() {
   export PGBACKREST_REPO1_PATH
 }
 
-# Patroni availability probe. 2s timeout keeps the watcher loop snappy on
-# standalone postgres-ssl where nothing answers on 8008.
-patroni_available() {
-  curl -sf -o /dev/null --max-time 2 "${PATRONI_API}/" 2>/dev/null
-}
-
-# Adopt the cluster-wide active path from Patroni DCS. Called near the top
-# of each leader iteration; after a leader handoff this catches a stale
-# .pgbackrest_repo_path inherited from basebackup before any archive
-# activity routes to the wrong prefix.
-sync_active_path_from_patroni() {
-  patroni_available || return 0
-  local dcs_path
-  dcs_path=$(curl -sf --max-time 5 "${PATRONI_API}/config" 2>/dev/null \
-    | jq -r '.rwy_active_archive_path // empty' 2>/dev/null) || return 0
-  [ -z "$dcs_path" ] && return 0
-  if [ "$dcs_path" != "$PGBACKREST_REPO1_PATH" ]; then
-    log "active-path: adopting ${dcs_path} from Patroni DCS (was ${PGBACKREST_REPO1_PATH:-unset})"
-    apply_active_path "$dcs_path"
-  fi
-}
-
-# Broadcast the freshly-chosen active path to Patroni DCS. PATCH /config
-# with a custom top-level key — Patroni stores and propagates to every
-# node via etcd/Consul/k8s without acting on the key itself. Failure is
-# logged, not fatal; the migration's own state machine keeps re-firing
-# until a future iteration's publish succeeds.
-publish_active_path_to_patroni() {
-  patroni_available || return 0
-  local path="$1"
-  curl -sf -X PATCH --max-time 5 \
-    -H 'Content-Type: application/json' \
-    -d "{\"rwy_active_archive_path\":\"${path}\"}" \
-    "${PATRONI_API}/config" >/dev/null 2>&1 \
-    || log "patroni: failed to publish active path (will re-assert next iteration)"
-}
-
 # Async-spool probe for ArchiveDuplicateError (exit 45). Catches the case
 # where async hit the regression but the foreground archive_command hasn't
 # yet been re-invoked to surface .error to pg_stat_archiver — so
@@ -498,15 +452,11 @@ probe_async_duplicate_error() {
 # (exit 45) so every archive-push fails — pkill-async cycles do not fix this.
 #
 # The migration is non-destructive: the old path and all its backups remain
-# in S3 untouched. Effective immediately without a redeploy because three
-# read paths all converge on the new path in lockstep:
+# in S3 untouched. Effective immediately without a redeploy because both
+# read paths converge on the new path in lockstep:
 #   - archive-push wrapper + this watcher re-read .pgbackrest_repo_path
 #   - mono's SSH-driven `pgbackrest info` (restore picker) reads repo1-path
 #     from /etc/pgbackrest/pgbackrest.conf — rewritten by apply_active_path
-#   - HA replicas adopt via Patroni DCS — publish_active_path_to_patroni
-#     PATCHes /config so a post-promotion leader sees the new path on its
-#     first iteration instead of restarting at the original cluster-SYSID
-#     and re-firing migration with a different epoch suffix
 #
 # Suffix is the wall-clock epoch at migration time, not an incrementing
 # generation counter. A counter lives in PGDATA's state file — a second
@@ -557,12 +507,8 @@ migrate_to_new_archive_path() {
   # Commit point: marker + conf + env in lockstep. SSH-driven `pgbackrest
   # info` from mono's restore picker reads the conf, not the marker, so a
   # conf that lags the marker would leave the restore UI invisible to the
-  # new path until the next container redeploy. Patroni DCS broadcast lets
-  # a post-promotion leader adopt this path on its first iteration instead
-  # of restarting at the original cluster-SYSID and re-firing migration
-  # with a different epoch suffix (orphaning the in-flight prefix).
+  # new path until the next container redeploy.
   apply_active_path "$new_path"
-  publish_active_path_to_patroni "$new_path"
 
   # Stale .error files in the async spool reference segments on the OLD
   # path — the conflict that produced them doesn't exist at the new
@@ -928,13 +874,6 @@ watcher_iteration() {
     log "iteration skipped: standby"
     return 0
   fi
-
-  # Adopt the cluster-wide active path from Patroni DCS before any archive
-  # activity. On the very first iteration after a leader handoff this picks
-  # up a path the prior leader wrote at migration time but that this node's
-  # local .pgbackrest_repo_path (inherited from basebackup) doesn't reflect.
-  # No-op on standalone postgres-ssl (port 8008 not listening).
-  sync_active_path_from_patroni
 
   emit_wal_heartbeat
 
