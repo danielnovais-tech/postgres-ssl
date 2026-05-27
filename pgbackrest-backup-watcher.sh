@@ -516,6 +516,17 @@ apply_active_path() {
 # version-stable identifier; the human-readable message phrasing has churned
 # across 2.x releases ("with different checksum" → "with a different
 # checksum" → …) and matching it would silently disarm on the next rename.
+wal_has_async_archive_duplicate_error() {
+  local wal="$1" err_file first_line
+  [ -n "$wal" ] || return 1
+  [ ${#wal} -eq 24 ] || return 1
+  case "$wal" in *[!0-9A-Fa-f]*) return 1 ;; esac
+  err_file="$SPOOL_ERR_DIR/${wal}.error"
+  [ -f "$err_file" ] || return 1
+  IFS= read -r first_line < "$err_file" 2>/dev/null || return 1
+  [ "$first_line" = "45" ]
+}
+
 probe_async_duplicate_error() {
   local catalog_max="${1:-}"
   [ -d "$SPOOL_ERR_DIR" ] || return 1
@@ -859,23 +870,20 @@ gap_recovery_step() {
 
     if [ "$since_action" -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ]; then
       # Escape hatch: after ≥2 pkill cycles with no catalog advance, check
-      # whether this is a WAL_REGRESSION. If last_failed_wal is at or before
-      # the catalog max on the same timeline, pkill-async cannot fix the
-      # conflict (the issue is structural — pgBackRest refuses to overwrite
-      # existing S3 objects with different content after a data-dir rollback).
-      # `-le` (not `-lt`) covers the boundary case where rollback lands
-      # exactly at the last successfully archived segment and postgres
-      # re-pushes that same segment number with different content.
+      # whether this is a WAL_REGRESSION. Require both active pg_stat_archiver
+      # evidence and the file-specific async status code 45
+      # (ArchiveDuplicateError); last_failed_wal <= catalog_max alone only
+      # proves the failure is at/before the repo frontier, not that pgBackRest
+      # refused to overwrite a different-checksum segment.
       #
       # Failsafe behind probe_async_duplicate_error above — which converges
       # in one poll cycle and doesn't need pg_stat_archiver to be populated
-      # — so in steady state this branch is dead. It survives for the case
-      # where the .error files got cleaned between iterations (kick races,
-      # operator pkill, async daemon restarted by something else) and the
-      # spool probe finds nothing, but pg_stat_archiver still reflects the
-      # underlying failure.
+      # — so in steady state this branch is dead. It survives for timeline /
+      # catalog_max mismatches where the broad spool scan skipped the file but
+      # LAST_FAILED_WAL can re-probe the matching timeline explicitly.
       if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] \
-         && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
+         && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
+         && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
         local wr_catalog_max
         wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
         if [ -n "$wr_catalog_max" ]; then
@@ -920,19 +928,20 @@ gap_recovery_step() {
 
   if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
     # Before entering the pkill-cycle state machine, check whether this is a
-    # WAL_REGRESSION: last_failed_wal is at or before the catalog max on the
-    # same timeline, meaning pgBackRest is refusing to overwrite existing S3
-    # objects with different content (exit 45). pkill-async cannot fix this —
-    # it is a structural archive conflict, not a stuck process. Self-heal
-    # immediately by migrating to a new archive path suffix. `-le` (not `-lt`)
-    # covers the boundary case where rollback lands exactly at the last
-    # archived segment.
+    # WAL_REGRESSION: pg_stat_archiver says the current failure is for a WAL at
+    # or before the catalog max on the same timeline AND the async status file
+    # for that WAL reports code 45 (ArchiveDuplicateError). pkill-async cannot
+    # fix a duplicate-segment conflict — it is structural, not a stuck process.
+    # Self-heal immediately by migrating to a new archive path suffix. `-le`
+    # (not `-lt`) covers the boundary case where rollback lands exactly at the
+    # last archived segment.
     #
     # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
     # currently active, not a stale pg_stat_archiver.last_failed_wal from an
     # old transient error (those fields are sticky until postgres restart).
     if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
-       && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
+       && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
+       && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
       local wr_catalog_max
       wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
       if [ -n "$wr_catalog_max" ]; then
