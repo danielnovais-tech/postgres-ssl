@@ -441,6 +441,32 @@ kick_async_daemon() {
   pkill -f 'archive-push:async' 2>/dev/null || true
 }
 
+# Rewrite repo1-path in pgbackrest.conf without requiring write permission on
+# /etc/pgbackrest. The watcher runs as postgres; wrapper.sh chowns the conf
+# file to postgres but leaves the directory root-owned, so sed -i/temp+rename
+# fails even though the file itself is writable. Render to a temp file under
+# PGDATA, then copy over the existing inode (file write permission is enough).
+rewrite_pgbackrest_conf_path() {
+  local path="$1" tmp
+  [ -f "$PGBACKREST_CONF_FILE" ] || return 0
+  tmp=$(mktemp "$PGDATA/.pgbackrest_conf.XXXX") || return 1
+  if ! awk -v path="$path" '
+    BEGIN { replaced = 0 }
+    /^repo1-path=/ { print "repo1-path=" path; replaced = 1; next }
+    { print }
+    END { if (!replaced) print "repo1-path=" path }
+  ' "$PGBACKREST_CONF_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! cat "$tmp" > "$PGBACKREST_CONF_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 # Source-of-truth setter for the active archive path. Updates the on-disk
 # marker (read by the archive-push wrapper on every call and by the watcher's
 # sync_repo_path_from_marker), rewrites repo1-path in
@@ -460,7 +486,7 @@ apply_active_path() {
   # (called by Postgres on every WAL switch) never sees a truncated /
   # half-written file. rename(2) within the same directory is atomic on
   # POSIX filesystems — the marker is either fully OLD or fully NEW for
-  # every reader. The conf rewrite below also has a `sed -i` non-atomic
+  # every reader. The conf rewrite below also has a non-atomic overwrite
   # window, but pgBackRest reads env > conf and the wrapper exports
   # PGBACKREST_REPO1_PATH from the marker, so the marker is the
   # load-bearing read path and the one that needs the atomicity guarantee.
@@ -469,10 +495,8 @@ apply_active_path() {
   tmp=$(mktemp "${marker}.XXXX") || return 1
   printf '%s\n' "$path" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$marker" || { rm -f "$tmp"; return 1; }
-  if [ -f "$PGBACKREST_CONF_FILE" ]; then
-    if ! sed -i "s|^repo1-path=.*|repo1-path=${path}|" "$PGBACKREST_CONF_FILE"; then
-      log "apply_active_path: failed to rewrite repo1-path in ${PGBACKREST_CONF_FILE} (marker + env are authoritative; bare-shell diagnostics will see stale path)"
-    fi
+  if ! rewrite_pgbackrest_conf_path "$path"; then
+    log "apply_active_path: failed to rewrite repo1-path in ${PGBACKREST_CONF_FILE} (marker + env are authoritative; bare-shell diagnostics will see stale path)"
   fi
   PGBACKREST_REPO1_PATH="$path"
   export PGBACKREST_REPO1_PATH
@@ -580,6 +604,24 @@ finalize_wal_regression_migration() {
   fi
 
   log "wal-regression: migration finalized at ${path}; async status cache cleared"
+}
+
+# If a prior iteration flipped the marker and cleaned stale spool statuses but
+# crashed (or hit a transient state-file write failure) before clearing
+# wal_regression_pending_new_path, no .error may remain to call
+# migrate_to_new_archive_path again. Retry finalization directly whenever the
+# active marker already equals the pending target; suppress other gap work for
+# this iteration so failures keep retrying cleanly on the next poll.
+finalize_pending_wal_regression_migration_if_needed() {
+  local pending
+  pending=$(read_state wal_regression_pending_new_path)
+  [ -z "$pending" ] && return 1
+  [ "${PGBACKREST_REPO1_PATH:-}" != "$pending" ] && return 1
+
+  GAP_STATE_DIAG="wal-regression-finalizing"
+  log "wal-regression: finalizing pending archive-path migration at ${pending}"
+  finalize_wal_regression_migration "$pending" || true
+  return 0
 }
 
 # Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
@@ -706,6 +748,10 @@ migrate_to_new_archive_path() {
 # avoid racing periodic-full/diff on top of an in-flight recovery.
 gap_recovery_step() {
   local now; now=$(date +%s)
+
+  if finalize_pending_wal_regression_migration_if_needed; then
+    return 0
+  fi
 
   local catalog_max
   catalog_max=$(probe_catalog_max)
