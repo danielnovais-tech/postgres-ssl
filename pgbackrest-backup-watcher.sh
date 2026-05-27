@@ -574,14 +574,26 @@ finalize_wal_regression_migration() {
   kick_async_daemon
   # Wait up to 2s for the daemon to actually exit before cleaning spool
   # files. pkill(1) is non-blocking — in the window between signal delivery
-  # and process exit the daemon's shutdown path can write a new .error file,
-  # which would survive the rm below and cause probe_async_duplicate_error
-  # to re-fire migration on the very next poll.
+  # and process exit the daemon's shutdown path can write a new .error/.ok
+  # file, which would survive the rm below and poison the new archive path.
   local _drain_deadline=$(($(date +%s) + 2))
   while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
         && [ "$(date +%s)" -lt "$_drain_deadline" ]; do
     sleep 0.2
   done
+  if pgrep -f 'archive-push:async' >/dev/null 2>&1; then
+    log "wal-regression: async daemon did not exit after TERM; forcing kill before cleaning spool"
+    pkill -9 -f 'archive-push:async' 2>/dev/null || true
+    local _kill_deadline=$(($(date +%s) + 2))
+    while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
+          && [ "$(date +%s)" -lt "$_kill_deadline" ]; do
+      sleep 0.2
+    done
+    if pgrep -f 'archive-push:async' >/dev/null 2>&1; then
+      log "wal-regression: async daemon still alive after SIGKILL; will retry finalization"
+      return 1
+    fi
+  fi
 
   # Stale async status files reference segments on the OLD path — the
   # conflict that produced .error files doesn't exist at the new (empty)
@@ -593,9 +605,8 @@ finalize_wal_regression_migration() {
     return 1
   fi
 
-  # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
-  # GAP_MARKER gate in decide_action, so its presence here wouldn't block
-  # the post-migrate full — removing it is purely tidiness.
+  # Clear the generic gap-recovery sentinel; wal_regression_pending_new_path
+  # remains the recovery-specific backup gate until finalization fully succeeds.
   rm -f "$GAP_MARKER"
 
   if ! write_state_field wal_regression_pending_new_path ""; then
@@ -744,8 +755,8 @@ migrate_to_new_archive_path() {
 # Called every iteration. Idempotent: re-entering the function while already
 # in recovery just advances the timers / inspects current catalog max.
 #
-# Returns 0 always — the caller's decide_action checks the gap marker to
-# avoid racing periodic-full/diff on top of an in-flight recovery.
+# Returns 0 always — migration-specific backup gating is handled by
+# wal_regression_pending_new_path in decide_action.
 gap_recovery_step() {
   local now; now=$(date +%s)
 
@@ -965,6 +976,17 @@ decide_action() {
   LAST_FULL_FAILED_DIAG="$last_full_failed"
   GAP_MARKER_DIAG=$([ -f "$GAP_MARKER" ] && echo "present" || echo "absent")
 
+  # WAL_REGRESSION migration is the only recovery path that must block
+  # backups: until the async daemon is stopped and stale old-path spool
+  # statuses are cleaned, a stale .ok can falsely satisfy archive-push on
+  # the new path. Generic WAL gaps are not gated here — if a full/diff can
+  # succeed while gap-recovery is running, that is useful signal.
+  local wal_regression_pending
+  wal_regression_pending=$(read_state wal_regression_pending_new_path)
+  if [ -n "$wal_regression_pending" ]; then
+    return 0
+  fi
+
   # NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest backup
   # brackets pg_backup_start/stop and waits for the closing WAL to archive
   # before declaring success, so a broken archive_command fails the backup
@@ -973,20 +995,6 @@ decide_action() {
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
   if [ -z "$last_full" ]; then
     DECIDED_ACTION="full"; return 0
-  fi
-
-  # Gap-recovery state machine owns the .pgbackrest_gap_pending marker. While
-  # the marker is present, decide_action stays silent — gap_recovery_step
-  # already ran this iteration and either took a diff, kicked the async
-  # daemon, or is waiting on the backoff. Racing a periodic full (or worse,
-  # a catalog-verify-triggered full) on top of an in-flight recovery would
-  # burn a full at the worst time (mid-outage). The marker check MUST stay
-  # above catalog-verify: an hourly verify firing mid-gap-recovery against
-  # a wedged S3 path can see backup.info just rotated by retention and
-  # mis-conclude "no full present" → clear last_full_at → force a full,
-  # which then fails through the same wedged S3.
-  if [ -f "$GAP_MARKER" ]; then
-    return 0
   fi
 
   # Catalog verification — periodically confirm S3 actually has a full backup.
