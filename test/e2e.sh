@@ -1950,22 +1950,35 @@ t_watcher_wal_regression_async_spool_probe() {
   # production behavior (daemon alive when migrate fires).
   docker exec "$name" pkill -f "archive-push:async" 2>/dev/null || true
 
-  # Plant a synthetic .error file in the async spool matching pgBackRest's
-  # real on-disk format (see src/command/archive/common.c —
-  # archiveAsyncStatus writes `<exit_code>\n<message>\n`). First line is
-  # the integer exit code (45 == ArchiveDuplicateError), which is what
-  # probe_async_duplicate_error matches against — version-stable across
-  # 2.x phrasing changes. File name = last_archived_wal → predicate's
-  # "same timeline, segment ≤ catalog_max" reduces to equality, the
-  # boundary case the migration's `-le` (not `-lt`) was widened to catch.
+  # Plant synthetic async status files matching pgBackRest's real on-disk
+  # format (see src/command/archive/common.c — archiveAsyncStatus writes
+  # `<exit_code>\n<message>\n`). First line is the integer exit code
+  # (45 == ArchiveDuplicateError), which is what probe_async_duplicate_error
+  # matches against — version-stable across 2.x phrasing changes. File name =
+  # last_archived_wal → predicate's "same timeline, segment ≤ catalog_max"
+  # reduces to equality, the boundary case the migration's `-le` (not `-lt`)
+  # was widened to catch. Also plant an alphabetically-earlier stale exit-45
+  # on another timeline so the probe must continue scanning until it finds
+  # the catalog-valid candidate, and plant a stale .ok to prove migration
+  # clears all old-path async statuses, not just .error files.
   docker exec "$name" sh -c "
     mkdir -p /var/lib/postgresql/data/pgbackrest-spool/archive/main/out
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error <<EOF
+45
+stale duplicate error from another timeline
+EOF
     cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error <<EOF
 45
 WAL segment ${last_archived} already exists in the archive with a different checksum
 EOF
-    chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error
-  " || { ko t_watcher_wal_regression_async_spool_probe "could not plant .error file"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok <<EOF
+0
+stale ok from old archive path
+EOF
+    chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error \
+      /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error \
+      /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok
+  " || { ko t_watcher_wal_regression_async_spool_probe "could not plant async status files"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
 
   # Wait for the watcher to log the migration. Poll = 5s; 60s allows two
   # iterations + state writes + the next iteration's post-migrate full to
@@ -2029,11 +2042,15 @@ EOF
     return
   fi
 
-  # migrate cleans the planted .error so the next iteration's probe doesn't
-  # re-fire on a leftover. Tested directly because a stuck leftover would
-  # cause migration churn (one new -<epoch> path per iteration).
-  if docker exec "$name" test -f "/var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error"; then
-    ko t_watcher_wal_regression_async_spool_probe "migrate did not clean planted .error file"
+  # migrate cleans planted async status files so the next iteration's probe
+  # doesn't re-fire on a leftover .error, and future archive-push calls can't
+  # treat stale old-path .ok files as proof a segment reached the NEW path.
+  if docker exec "$name" sh -c "
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error || \
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error || \
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok
+  "; then
+    ko t_watcher_wal_regression_async_spool_probe "migrate did not clean planted async status files"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
   fi

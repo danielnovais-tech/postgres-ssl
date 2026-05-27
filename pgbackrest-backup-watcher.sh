@@ -466,8 +466,8 @@ apply_active_path() {
 # where async hit the regression but the foreground archive_command hasn't
 # yet been re-invoked to surface .error to pg_stat_archiver — so
 # LAST_FAILED_WAL is still NULL/stale and the failed_grew + epoch guards
-# below can't fire. Echoes the WAL filename of the first matching error;
-# returns non-zero if none found.
+# below can't fire. Echoes the WAL filename of the first catalog-valid
+# matching error; returns non-zero if none found.
 #
 # Match key is the first line of the .error file, which pgBackRest writes as
 # the integer exit code (see src/command/archive/common.c — archiveModePush
@@ -477,26 +477,38 @@ apply_active_path() {
 # across 2.x releases ("with different checksum" → "with a different
 # checksum" → …) and matching it would silently disarm on the next rename.
 probe_async_duplicate_error() {
+  local catalog_max="${1:-}"
   [ -d "$SPOOL_ERR_DIR" ] || return 1
   local err_file first_line base
   for err_file in "$SPOOL_ERR_DIR"/*.error; do
     [ -f "$err_file" ] || continue
     # Skip non-WAL-segment errors (backup history files like
     # <wal>.<offset>.backup also archive through this path and produce
-    # <name>.backup.error on exit 45). Without this filter, an
-    # alphabetically-earlier .backup.error would short-circuit the loop
-    # before reaching a real WAL-segment .error, the predicate's
-    # segment_to_number would reject the 31-char name and return empty,
-    # and migration would silently fail to fire that iteration. Same
-    # strict shape as segment_to_number's input check.
+    # <name>.backup.error on exit 45). Same strict shape as
+    # segment_to_number's input check.
     base=$(basename "$err_file" .error)
     [ ${#base} -eq 24 ] || continue
     case "$base" in *[!0-9A-Fa-f]*) continue ;; esac
     IFS= read -r first_line < "$err_file" 2>/dev/null || continue
-    if [ "$first_line" = "45" ]; then
-      echo "$base"
-      return 0
+    [ "$first_line" = "45" ] || continue
+
+    # When catalog_max is available, verify the failing segment is on the same
+    # timeline and at or before the S3 max — guards against stale .error files
+    # written on another timeline. If the first exit-45 file is stale, keep
+    # scanning: a later .error may be the real WAL_REGRESSION signal.
+    local d_n
+    d_n=$(segment_to_number "$base")
+    [ -n "$d_n" ] || continue
+    if [ -n "$catalog_max" ]; then
+      local d_tl c_tl c_n
+      d_tl="${base:0:8}"
+      c_tl="${catalog_max:0:8}"
+      c_n=$(segment_to_number "$catalog_max")
+      [ "$d_tl" = "$c_tl" ] && [ -n "$c_n" ] && [ "$d_n" -le "$c_n" ] || continue
     fi
+
+    echo "$base"
+    return 0
   done
   return 1
 }
@@ -619,13 +631,12 @@ migrate_to_new_archive_path() {
     sleep 0.2
   done
 
-  # Stale .error files in the async spool reference segments on the OLD
-  # path — the conflict that produced them doesn't exist at the new
-  # (empty) path. Without cleanup the next iteration's
-  # probe_async_duplicate_error would re-fire migration on leftovers.
-  # The spool is a coordination cache, never durable data — async
-  # re-uploads from pg_wal on next call.
-  rm -f "$SPOOL_ERR_DIR"/*.error 2>/dev/null || true
+  # Stale async status files reference segments on the OLD path — the
+  # conflict that produced .error files doesn't exist at the new (empty)
+  # path, and .ok files can incorrectly satisfy future archive-push calls
+  # without uploading the segment to the NEW path. The spool is a coordination
+  # cache, never durable data — async re-uploads from pg_wal on next call.
+  rm -f "$SPOOL_ERR_DIR"/*.error "$SPOOL_ERR_DIR"/*.ok 2>/dev/null || true
 
   # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
   # GAP_MARKER gate in decide_action, so its presence here wouldn't block
@@ -681,32 +692,14 @@ gap_recovery_step() {
   # downstream regression detection can't fire. Read the spool directly so
   # an async-only wedge converges in one poll cycle.
   local dup_seg
-  if dup_seg=$(probe_async_duplicate_error) && [ -n "$dup_seg" ]; then
-    local d_tl d_n
-    d_tl="${dup_seg:0:8}"
-    d_n=$(segment_to_number "$dup_seg")
-    # When catalog_max is available, verify the failing segment is on the same
-    # timeline and at or before the S3 max — guards against a stale .error
-    # written on a different timeline. When catalog_max is empty
-    # (LAST_ARCHIVED_WAL unset after a postgres restart — exactly the
-    # post-rollback scenario this probe is designed for), trust the exit-45
-    # evidence directly: a segment already present in S3 at a different
-    # checksum is self-evident proof of WAL_REGRESSION regardless of what
-    # pgbackrest info can currently enumerate.
-    local _dup_ok=0
-    if [ -z "$catalog_max" ]; then
-      [ -n "$d_n" ] && _dup_ok=1
-    else
-      local _c_tl _c_n
-      _c_tl="${catalog_max:0:8}"; _c_n=$(segment_to_number "$catalog_max")
-      [ "$d_tl" = "$_c_tl" ] && [ -n "$d_n" ] && [ -n "$_c_n" ] \
-        && [ "$d_n" -le "$_c_n" ] && _dup_ok=1
-    fi
-    if [ "$_dup_ok" -eq 1 ]; then
-      log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max:-unknown}) — self-healing"
-      migrate_to_new_archive_path
-      return 0
-    fi
+  if dup_seg=$(probe_async_duplicate_error "$catalog_max") && [ -n "$dup_seg" ]; then
+    # When catalog_max is empty (LAST_ARCHIVED_WAL unset after a postgres
+    # restart — exactly the post-rollback scenario this probe is designed for),
+    # the probe trusts exit-45 evidence directly: a segment already present in
+    # S3 at a different checksum is self-evident proof of WAL_REGRESSION.
+    log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max:-unknown}) — self-healing"
+    migrate_to_new_archive_path
+    return 0
   fi
 
   # In recovery? Marker is the truth — either we set it on a previous lag
