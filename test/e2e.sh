@@ -1940,12 +1940,12 @@ t_watcher_wal_regression_async_spool_probe() {
   # "same timeline, segment ≤ catalog_max" reduces to equality, the
   # boundary case the migration's `-le` (not `-lt`) was widened to catch.
   docker exec "$name" sh -c "
-    mkdir -p /var/lib/postgresql/data/pgbackrest-spool/archive/main/in
-    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/in/${last_archived}.error <<EOF
+    mkdir -p /var/lib/postgresql/data/pgbackrest-spool/archive/main/out
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error <<EOF
 45
 WAL segment ${last_archived} already exists in the archive with a different checksum
 EOF
-    chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/in/${last_archived}.error
+    chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error
   " || { ko t_watcher_wal_regression_async_spool_probe "could not plant .error file"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
 
   # Wait for the watcher to log the migration. Poll = 5s; 60s allows two
@@ -2013,7 +2013,7 @@ EOF
   # migrate cleans the planted .error so the next iteration's probe doesn't
   # re-fire on a leftover. Tested directly because a stuck leftover would
   # cause migration churn (one new -<epoch> path per iteration).
-  if docker exec "$name" test -f "/var/lib/postgresql/data/pgbackrest-spool/archive/main/in/${last_archived}.error"; then
+  if docker exec "$name" test -f "/var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error"; then
     ko t_watcher_wal_regression_async_spool_probe "migrate did not clean planted .error file"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return

@@ -78,7 +78,7 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 STATE_FILE="$PGDATA/.pgbackrest_backup_state"
 GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
-SPOOL_ERR_DIR="$PGDATA/pgbackrest-spool/archive/main/in"
+SPOOL_ERR_DIR="$PGDATA/pgbackrest-spool/archive/main/out"
 
 # POLL_INTERVAL_SECONDS / GAP_RECOVERY_BACKOFF_SECONDS are env-overridable so
 # the e2e harness can exercise gap-recovery in <1 min instead of 10+. The
@@ -459,8 +459,9 @@ apply_active_path() {
 # returns non-zero if none found.
 #
 # Match key is the first line of the .error file, which pgBackRest writes as
-# the integer exit code (see src/command/archive/common.c — archiveAsyncStatus
-# writes `<code>\n<message>`). 45 == ArchiveDuplicateError is the only
+# the integer exit code (see src/command/archive/common.c — archiveModePush
+# uses the `out` queue; archiveAsyncStatusErrorWrite writes
+# `<code>\n<message>`). 45 == ArchiveDuplicateError is the only
 # version-stable identifier; the human-readable message phrasing has churned
 # across 2.x releases ("with different checksum" → "with a different
 # checksum" → …) and matching it would silently disarm on the next rename.
@@ -552,7 +553,10 @@ migrate_to_new_archive_path() {
   # mono's restore picker actually reads (it inspects the marker and
   # exports PGBACKREST_REPO1_PATH for its `pgbackrest info` calls); the
   # conf rewrite is defense-in-depth for bare-shell diagnostics.
-  apply_active_path "$new_path"
+  if ! apply_active_path "$new_path"; then
+    log "wal-regression: failed to apply new archive path (${new_path}); will retry"
+    return 1
+  fi
 
   # Force-respawn the async daemon. pgBackRest's async worker reads its
   # repo1-path once at fork/exec time and holds it for the daemon's
