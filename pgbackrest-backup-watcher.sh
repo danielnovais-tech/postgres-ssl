@@ -139,6 +139,15 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       proof is "current catalog_max > this")
 #   last_force_recovery_at=<epoch>   — last time we pkill'd the async daemon
 #   force_attempts=<int>             — pkill cycles this gap-recovery cycle
+#   wal_regression_orig_path=<path>  — pre-migration repo1-path, set on the
+#                                       first WAL_REGRESSION self-heal and
+#                                       never cleared. Successive migrations
+#                                       compose suffix off this (orig-<e2>),
+#                                       not the live path (orig-<e1>-<e2>),
+#                                       so a customer who triggers multiple
+#                                       rollbacks gets flat sibling prefixes
+#                                       (cluster-X, cluster-X-e1, cluster-X-e2)
+#                                       rather than a deepening chain.
 read_state() {
   local field="$1"
   [ ! -f "$STATE_FILE" ] && return 0
@@ -422,7 +431,19 @@ kick_async_daemon() {
 apply_active_path() {
   local path="$1"
   [ -z "$path" ] && return 1
-  echo "$path" > "$PGDATA/.pgbackrest_repo_path"
+  # tmp+rename so a concurrent `cat $marker` from the archive-push wrapper
+  # (called by Postgres on every WAL switch) never sees a truncated /
+  # half-written file. rename(2) within the same directory is atomic on
+  # POSIX filesystems — the marker is either fully OLD or fully NEW for
+  # every reader. The conf rewrite below also has a `sed -i` non-atomic
+  # window, but pgBackRest reads env > conf and the wrapper exports
+  # PGBACKREST_REPO1_PATH from the marker, so the marker is the
+  # load-bearing read path and the one that needs the atomicity guarantee.
+  local marker="$PGDATA/.pgbackrest_repo_path"
+  local tmp
+  tmp=$(mktemp "${marker}.XXXX") || return 1
+  printf '%s\n' "$path" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$marker" || { rm -f "$tmp"; return 1; }
   if [ -f "$PGBACKREST_CONF_FILE" ]; then
     sed -i "s|^repo1-path=.*|repo1-path=${path}|" "$PGBACKREST_CONF_FILE"
   fi
@@ -435,15 +456,21 @@ apply_active_path() {
 # yet been re-invoked to surface .error to pg_stat_archiver — so
 # LAST_FAILED_WAL is still NULL/stale and the failed_grew + epoch guards
 # below can't fire. Echoes the WAL filename of the first matching error;
-# returns non-zero if none found. Pattern set is pgBackRest 2.x — the
-# integer exit-code line is the most version-stable of the three.
+# returns non-zero if none found.
+#
+# Match key is the first line of the .error file, which pgBackRest writes as
+# the integer exit code (see src/command/archive/common.c — archiveAsyncStatus
+# writes `<code>\n<message>`). 45 == ArchiveDuplicateError is the only
+# version-stable identifier; the human-readable message phrasing has churned
+# across 2.x releases ("with different checksum" → "with a different
+# checksum" → …) and matching it would silently disarm on the next rename.
 probe_async_duplicate_error() {
   [ -d "$SPOOL_ERR_DIR" ] || return 1
-  local err_file
+  local err_file first_line
   for err_file in "$SPOOL_ERR_DIR"/*.error; do
     [ -f "$err_file" ] || continue
-    if grep -qE 'ArchiveDuplicateError|exit code: ?45|already exists in the (archive|repo).*different' \
-       "$err_file" 2>/dev/null; then
+    IFS= read -r first_line < "$err_file" 2>/dev/null || continue
+    if [ "$first_line" = "45" ]; then
       basename "$err_file" .error
       return 0
     fi
@@ -527,12 +554,27 @@ migrate_to_new_archive_path() {
   # conf rewrite is defense-in-depth for bare-shell diagnostics.
   apply_active_path "$new_path"
 
+  # Force-respawn the async daemon. pgBackRest's async worker reads its
+  # repo1-path once at fork/exec time and holds it for the daemon's
+  # lifetime — config rewrites and env changes do NOT propagate to a
+  # running daemon. Without this kick the OLD async daemon keeps draining
+  # the spool to the OLD path long after the marker flips, the
+  # post-migrate full's closing WAL never reaches the NEW path, and
+  # self-heal stalls until the regular gap-recovery loop pkills it
+  # (~GAP_RECOVERY_BACKOFF_SECONDS, default 10 min). pkill here drops
+  # that window to ~archive_timeout (default 60s) — the next foreground
+  # archive-push respawns the daemon with the new env / new conf.
+  log "wal-regression: kicking async daemon to pick up new repo1-path"
+  kick_async_daemon
+
   # Stale .error files in the async spool reference segments on the OLD
   # path — the conflict that produced them doesn't exist at the new
   # (empty) path. Without cleanup the next iteration's
   # probe_async_duplicate_error would re-fire migration on leftovers.
   # The spool is a coordination cache, never durable data — async
-  # re-uploads from pg_wal on next call.
+  # re-uploads from pg_wal on next call. Cleanup runs AFTER the kick so
+  # any final flush from the dying daemon doesn't recreate the file
+  # we're about to delete.
   rm -f "$SPOOL_ERR_DIR"/*.error 2>/dev/null || true
 
   # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the

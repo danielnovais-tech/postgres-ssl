@@ -1923,28 +1923,27 @@ t_watcher_wal_regression_async_spool_probe() {
     return
   fi
 
-  # Kill the async pgBackRest daemon before planting the .error file. In a
-  # healthy container (no actual rollback) the async daemon watches the spool
-  # via inotify and will immediately re-queue the segment when a .error file
-  # appears. Since the segment IS already in S3 with the same checksum,
-  # pgBackRest exits 0 and cleans up the file in sub-second time — before the
-  # first watcher poll (5s). Stopping the daemon first prevents that race.
-  # archive_timeout=60s means the next archive_command invocation is ~60s
-  # away, giving the watcher ample time to detect and process the file.
+  # Pre-kill the async daemon so the synthetic .error file isn't auto-
+  # cleaned by the daemon's inotify-driven re-queue: the planted WAL
+  # segment IS in S3 with the same checksum, so the daemon would exit 0
+  # and remove the file in sub-second time, before the first watcher
+  # poll. The "kicking async daemon" log-line assertion below covers the
+  # production behavior (daemon alive when migrate fires).
   docker exec "$name" pkill -f "archive-push:async" 2>/dev/null || true
 
-  # Plant a synthetic .error file in the async spool. Content matches all
-  # three patterns in probe_async_duplicate_error's regex so future pgBackRest
-  # message-format drift on any one phrase doesn't silently disarm the test.
-  # File name = last_archived_wal → predicate's "same timeline, segment ≤
-  # catalog_max" reduces to equality, the boundary case the migration's `-le`
-  # (not `-lt`) was widened to catch.
+  # Plant a synthetic .error file in the async spool matching pgBackRest's
+  # real on-disk format (see src/command/archive/common.c —
+  # archiveAsyncStatus writes `<exit_code>\n<message>\n`). First line is
+  # the integer exit code (45 == ArchiveDuplicateError), which is what
+  # probe_async_duplicate_error matches against — version-stable across
+  # 2.x phrasing changes. File name = last_archived_wal → predicate's
+  # "same timeline, segment ≤ catalog_max" reduces to equality, the
+  # boundary case the migration's `-le` (not `-lt`) was widened to catch.
   docker exec "$name" sh -c "
     mkdir -p /var/lib/postgresql/data/pgbackrest-spool/archive/main/in
     cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/in/${last_archived}.error <<EOF
-ERROR: [045]: ArchiveDuplicateError
-WAL segment ${last_archived} already exists in the archive with different checksum
-exit code: 45
+45
+WAL segment ${last_archived} already exists in the archive with a different checksum
 EOF
     chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/in/${last_archived}.error
   " || { ko t_watcher_wal_regression_async_spool_probe "could not plant .error file"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
@@ -1961,6 +1960,16 @@ EOF
   done
   if [ "$hit_migrate" != "1" ]; then
     ko t_watcher_wal_regression_async_spool_probe "watcher did not log wal-regression migration within deadline"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Migrate must explicitly kick the async daemon so the post-migrate
+  # closing WAL reaches the NEW path on the next archive_command (~60s),
+  # not after a 10-min gap-recovery loop pkill. Without this, the daemon
+  # holds the OLD repo1-path for its lifetime and self-heal stalls.
+  if ! docker logs "$name" 2>&1 | grep -q "wal-regression: kicking async daemon"; then
+    ko t_watcher_wal_regression_async_spool_probe "migrate did not kick the async daemon (kick log line missing)"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
   fi
