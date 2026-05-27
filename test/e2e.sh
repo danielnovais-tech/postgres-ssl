@@ -1880,6 +1880,239 @@ t_watcher_gap_recovery_lsn_lag_path() {
   docker volume rm "$vol" >/dev/null
 }
 
+# WAL_REGRESSION self-heal via async-spool probe. Simulates the post-volume-
+# rollback failure mode by planting a synthetic ArchiveDuplicateError in the
+# async spool's .error directory — the same shape pgBackRest writes when it
+# tries to push a segment whose name already exists in S3 with different
+# content. The probe path runs before any of the foreground-signal branches,
+# so we don't need to coordinate with pg_stat_archiver or wait through a
+# pkill backoff: a single planted .error file is enough to fire migrate.
+#
+# Engineering a "real" rollback would require stopping postgres, snapshotting
+# PGDATA, advancing the LSN with extra archive-pushes, then restoring the
+# snapshot — doable but heavy. The probe is also the only detection path
+# that fires when the foreground archive_command hasn't been re-invoked yet
+# (last_failed_wal still NULL on a quiet DB), so it's the most defensive of
+# the three branches to pin down with automation.
+t_watcher_wal_regression_async_spool_probe() {
+  local name=t-walreg-spool-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_watcher_wal_regression_async_spool_probe "no startup"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_wal_regression_async_spool_probe "no initial full"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
+
+  # Snapshot the original marker + last_archived_wal so we can assert the
+  # migration target and that the old path's full survives.
+  local orig_path orig_full_count last_archived
+  orig_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
+  orig_full_count=$(count_backups_of_type "$name" full)
+
+  # After a full backup pgBackRest archives a backup history file
+  # (e.g. 000000010000000000000003.00000028.backup) via archive_command, and
+  # pg_stat_archiver reflects it as last_archived_wal. That name is not a
+  # plain 24-char WAL segment, so segment_to_number rejects it and the
+  # probe_async_duplicate_error boundary check fails silently. Force a WAL
+  # switch here so the next archived file is a real segment, then poll until
+  # last_archived_wal is exactly 24 hex chars before planting the .error.
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  local seg_deadline=$(($(date +%s) + 20))
+  last_archived=""
+  while [ "$(date +%s)" -lt "$seg_deadline" ]; do
+    local candidate
+    candidate=$(docker exec "$name" psql -U postgres -At \
+      -c "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null)
+    if [ "${#candidate}" -eq 24 ]; then
+      last_archived="$candidate"
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$last_archived" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "no 24-char WAL segment in last_archived_wal after pg_switch_wal"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Pre-kill the async daemon so the synthetic .error file isn't auto-
+  # cleaned by the daemon's inotify-driven re-queue: the planted WAL
+  # segment IS in S3 with the same checksum, so the daemon would exit 0
+  # and remove the file in sub-second time, before the first watcher
+  # poll. The "kicking async daemon" log-line assertion below covers the
+  # production behavior (daemon alive when migrate fires).
+  docker exec "$name" pkill -f "archive-push:async" 2>/dev/null || true
+
+  # Plant synthetic async status files matching pgBackRest's real on-disk
+  # format (see src/command/archive/common.c — archiveAsyncStatus writes
+  # `<exit_code>\n<message>\n`). First line is the integer exit code
+  # (45 == ArchiveDuplicateError), which is what probe_async_duplicate_error
+  # matches against — version-stable across 2.x phrasing changes. File name =
+  # last_archived_wal → predicate's "same timeline, segment ≤ catalog_max"
+  # reduces to equality, the boundary case the migration's `-le` (not `-lt`)
+  # was widened to catch. Also plant an alphabetically-earlier stale exit-45
+  # on another timeline so the probe must continue scanning until it finds
+  # the catalog-valid candidate, and plant a stale .ok to prove migration
+  # clears all old-path async statuses, not just .error files.
+  docker exec "$name" sh -c "
+    mkdir -p /var/lib/postgresql/data/pgbackrest-spool/archive/main/out
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error <<EOF
+45
+stale duplicate error from another timeline
+EOF
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error <<EOF
+45
+WAL segment ${last_archived} already exists in the archive with a different checksum
+EOF
+    cat > /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok <<EOF
+0
+stale ok from old archive path
+EOF
+    chown postgres:postgres /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error \
+      /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error \
+      /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok
+  " || { ko t_watcher_wal_regression_async_spool_probe "could not plant async status files"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
+
+  # Wait for the watcher to log the migration. Poll = 5s; 60s allows two
+  # iterations + state writes + the next iteration's post-migrate full to
+  # start landing in the log buffer.
+  local deadline=$(($(date +%s) + 60)) hit_migrate=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "wal-regression: migrating archive path"; then
+      hit_migrate=1; break
+    fi
+    sleep 2
+  done
+  if [ "$hit_migrate" != "1" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "watcher did not log wal-regression migration within deadline"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Migrate must explicitly kick the async daemon so the post-migrate
+  # closing WAL reaches the NEW path on the next archive_command (~60s),
+  # not after a 10-min gap-recovery loop pkill. Without this, the daemon
+  # holds the OLD repo1-path for its lifetime and self-heal stalls.
+  if ! docker logs "$name" 2>&1 | grep -q "wal-regression: kicking async daemon"; then
+    ko t_watcher_wal_regression_async_spool_probe "migrate did not kick the async daemon (kick log line missing)"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Marker must now point at `<orig_path>-<digits>` (epoch suffix). Epoch
+  # is wall-clock seconds, so >=1 decimal digit; we don't pin a specific
+  # value because clock skew under CI load can shift it.
+  local new_path
+  new_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
+  case "$new_path" in
+    "${orig_path}-"[0-9]*) ;;
+    *)
+      ko t_watcher_wal_regression_async_spool_probe "marker did not get an epoch suffix; orig=${orig_path}, new=${new_path}"
+      fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+      return ;;
+  esac
+
+  # State file must record the pre-migration path so successive migrations
+  # land at cluster-X-<e2> rather than chaining suffixes (cluster-X-<e1>-<e2>).
+  local orig_in_state
+  orig_in_state=$(docker exec "$name" grep -E "^wal_regression_orig_path=" \
+    /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
+  if [ "$orig_in_state" != "$orig_path" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "wal_regression_orig_path expected '${orig_path}', got '${orig_in_state}'"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Pending target must only clear after marker flip + async spool cleanup
+  # finalize successfully. If this sticks, a later iteration is expected to
+  # retry finalization rather than trusting stale old-path .ok/.error files.
+  local pending_in_state
+  pending_in_state=$(docker exec "$name" grep -E "^wal_regression_pending_new_path=" \
+    /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
+  if [ -n "$pending_in_state" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "wal_regression_pending_new_path should be clear after finalize, got '${pending_in_state}'"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # The rendered pgbackrest.conf must have repo1-path rewritten too —
+  # defense for bare-shell diagnostics that don't go through the
+  # PGBACKREST_REPO1_PATH env override that mono's picker uses.
+  local conf_path
+  conf_path=$(docker exec "$name" grep -E "^repo1-path=" \
+    /etc/pgbackrest/pgbackrest.conf 2>/dev/null | cut -d= -f2-)
+  if [ "$conf_path" != "$new_path" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "pgbackrest.conf repo1-path expected '${new_path}', got '${conf_path}'"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # migrate cleans planted async status files so the next iteration's probe
+  # doesn't re-fire on a leftover .error, and future archive-push calls can't
+  # treat stale old-path .ok files as proof a segment reached the NEW path.
+  if docker exec "$name" sh -c "
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/000000000000000000000001.error || \
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.error || \
+    test -e /var/lib/postgresql/data/pgbackrest-spool/archive/main/out/${last_archived}.ok
+  "; then
+    ko t_watcher_wal_regression_async_spool_probe "migrate did not clean planted async status files"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Wait for the post-migrate NEEDS_INITIAL_BACKUP full to land at the new
+  # path. last_full_at="" was written before the marker flip, so the next
+  # iteration's decide_action takes a full unconditionally. Drive WAL
+  # switches to keep the archive-push warm; the stanza-create on the new
+  # path needs at least one segment to anchor against.
+  local full_deadline=$(($(date +%s) + 120)) full_hit=0
+  while [ "$(date +%s)" -lt "$full_deadline" ]; do
+    local now_count
+    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+    if [ "$now_count" -gt 1 ]; then full_hit=1; break; fi   # initial + post-migrate
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 3
+  done
+  if [ "$full_hit" != "1" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "post-migrate full did not land within deadline"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  # Old path's full survives — the migration is non-destructive. Probe
+  # the old path directly with a per-call PGBACKREST_REPO1_PATH override.
+  # This is the exact mechanism mono's usePitrHistories uses to enumerate
+  # orphaned histories in the restore UI, so this assertion also confirms
+  # the UI's discovery path works end-to-end after self-heal.
+  local old_fulls_after
+  old_fulls_after=$(docker exec -u postgres "$name" bash -c "
+    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+    export PGBACKREST_REPO1_PATH=\"$orig_path\"
+    pgbackrest --stanza=main info 2>/dev/null | grep -cE '^[[:space:]]+full backup: ' || true
+  " 2>/dev/null | tail -1)
+  if [ "${old_fulls_after:-0}" -lt "$orig_full_count" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "old path full count regressed: was ${orig_full_count}, now ${old_fulls_after}"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
+  ok t_watcher_wal_regression_async_spool_probe
+  note "migrated ${orig_path} → ${new_path}; old full preserved (${old_fulls_after} visible at ${orig_path})"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # G2. PITR target older than oldest-retained full → wrapper exits 1 with a
 # clear "no matching backup set" error. Image-level defense-in-depth for the
 # mono mutation's pre-validation, which can be stale by the time the
@@ -3312,6 +3545,7 @@ ALL_TESTS=(
   t_retention_expires_old_fulls
   t_watcher_gap_recovery_failed_count_path
   t_watcher_gap_recovery_lsn_lag_path
+  t_watcher_wal_regression_async_spool_probe
   t_pitr_target_before_retention_window_refuses
   t_retention_expire_cascades_to_wal
   t_empty_volume_restore_refuses_on_bad_creds

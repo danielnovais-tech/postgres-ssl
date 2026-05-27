@@ -110,7 +110,7 @@ fi
 # to a spool status file. Print it so the actual failure reason appears in
 # deployment logs instead of being invisible.
 WAL_BASENAME=$(basename "$WAL_FILE")
-SPOOL_ERR="${PGDATA}/pgbackrest-spool/archive/main/in/${WAL_BASENAME}.error"
+SPOOL_ERR="${PGDATA}/pgbackrest-spool/archive/main/out/${WAL_BASENAME}.error"
 if [ -f "$SPOOL_ERR" ]; then
   printf 'pgbackrest-wrapper: async spool error for %s (rc=%s):\n' "$WAL_BASENAME" "$PGB_RC" >&2
   cat "$SPOOL_ERR" >&2
