@@ -1923,6 +1923,16 @@ t_watcher_wal_regression_async_spool_probe() {
     return
   fi
 
+  # Kill the async pgBackRest daemon before planting the .error file. In a
+  # healthy container (no actual rollback) the async daemon watches the spool
+  # via inotify and will immediately re-queue the segment when a .error file
+  # appears. Since the segment IS already in S3 with the same checksum,
+  # pgBackRest exits 0 and cleans up the file in sub-second time — before the
+  # first watcher poll (5s). Stopping the daemon first prevents that race.
+  # archive_timeout=60s means the next archive_command invocation is ~60s
+  # away, giving the watcher ample time to detect and process the file.
+  docker exec "$name" pkill -f "archive-push:async" 2>/dev/null || true
+
   # Plant a synthetic .error file in the async spool. Content matches all
   # three patterns in probe_async_duplicate_error's regex so future pgBackRest
   # message-format drift on any one phrase doesn't silently disarm the test.
