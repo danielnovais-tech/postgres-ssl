@@ -547,6 +547,17 @@ probe_async_duplicate_error() {
     # timeline and at or before the S3 max — guards against stale .error files
     # written on another timeline. If the first exit-45 file is stale, keep
     # scanning: a later .error may be the real WAL_REGRESSION signal.
+    #
+    # When catalog_max is empty (LAST_ARCHIVED_WAL unset after postgres
+    # restart — the post-rollback scenario this probe is designed for), we
+    # accept the first matching file in glob order regardless of age. Glob
+    # is lexicographic, so this is not the most-recent .error. That's OK:
+    # an exit-45 .error is self-evident proof that pgBackRest hit a segment
+    # already in S3 with different content. Whichever such file we picked,
+    # migration to a fresh path suffix is the correct response — the new
+    # path is empty and won't conflict, and the old path's contents stay
+    # reachable via mono's PITR restore UI. Picking a "wrong" exit-45 file
+    # would still trigger the right action.
     local d_n
     d_n=$(segment_to_number "$base")
     [ -n "$d_n" ] || continue
