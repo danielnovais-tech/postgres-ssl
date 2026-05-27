@@ -148,6 +148,15 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       rollbacks gets flat sibling prefixes
 #                                       (cluster-X, cluster-X-e1, cluster-X-e2)
 #                                       rather than a deepening chain.
+#   wal_regression_pending_new_path=<path>
+#                                     — in-flight migration target. Written
+#                                       before apply_active_path; cleared on
+#                                       success. On retry after a transient
+#                                       apply_active_path failure, reuse this
+#                                       instead of computing a fresh epoch —
+#                                       otherwise every retry would create a
+#                                       new cluster-X-<epoch> sibling and
+#                                       spam orphaned prefixes.
 read_state() {
   local field="$1"
   [ ! -f "$STATE_FILE" ] && return 0
@@ -445,7 +454,9 @@ apply_active_path() {
   printf '%s\n' "$path" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$marker" || { rm -f "$tmp"; return 1; }
   if [ -f "$PGBACKREST_CONF_FILE" ]; then
-    sed -i "s|^repo1-path=.*|repo1-path=${path}|" "$PGBACKREST_CONF_FILE"
+    if ! sed -i "s|^repo1-path=.*|repo1-path=${path}|" "$PGBACKREST_CONF_FILE"; then
+      log "apply_active_path: failed to rewrite repo1-path in ${PGBACKREST_CONF_FILE} (marker + env are authoritative; bare-shell diagnostics will see stale path)"
+    fi
   fi
   PGBACKREST_REPO1_PATH="$path"
   export PGBACKREST_REPO1_PATH
@@ -501,34 +512,39 @@ probe_async_duplicate_error() {
 # in S3 untouched and remain reachable through mono's PITR restore UI —
 # usePitrHistories.tsx discovers every cluster-* sub-prefix in the bucket
 # and offers each as a selectable restore source (`isCurrent` flag
-# distinguishes the active path from orphans), so a customer can still
-# PITR off the pre-rollback path if they want. No customer-side action is
-# required to keep that data reachable.
-#
-# Effective immediately without a redeploy because every read path converges
-# on the new path in lockstep:
-#   - archive-push wrapper + this watcher re-read .pgbackrest_repo_path on
-#     every call/iteration
-#   - mono's SSH probe reads the marker first and exports
-#     PGBACKREST_REPO1_PATH (env > conf), so the picker sees the new path
-#     the moment the marker flips
-#   - /etc/pgbackrest/pgbackrest.conf is rewritten for bare-shell diagnostics
+# distinguishes the active path from orphans). No customer-side action is
+# required to keep that data reachable. Effective immediately without a
+# redeploy — see apply_active_path's docblock for the marker/env/conf
+# convergence.
 #
 # Suffix is the wall-clock epoch at migration time, not an incrementing
 # generation counter. A counter lives in PGDATA's state file — a second
 # volume-snapshot rollback to a pre-self-heal PGDATA would reset the counter
 # to 0 and re-pick the same `-2` suffix as a prior migration, colliding with
 # the still-broken contents at that path. Epoch-suffixed paths are unique
-# across rollbacks for as long as wall-clock advances.
+# across rollbacks for as long as wall-clock advances. The computed epoch is
+# persisted in wal_regression_pending_new_path before the state reset and
+# reused on retry, so a transiently-failing apply_active_path doesn't spawn
+# a new sibling prefix per poll.
 #
 # Crash safety: state-reset writes land BEFORE the marker flip. A crash in
 # the middle leaves marker=OLD + last_full_at="" — the next iteration
 # re-detects WAL_REGRESSION at the old path and re-fires this function with
-# a fresh epoch, converging cleanly. The alternative (marker first) would
-# strand the watcher at the new empty path with stale last_full_at, skipping
-# NEEDS_INITIAL_BACKUP and waiting up to a full catalog-verify cycle to heal.
+# the persisted pending new_path, converging cleanly. The alternative
+# (marker first) would strand the watcher at the new empty path with stale
+# last_full_at, skipping NEEDS_INITIAL_BACKUP and waiting up to a full
+# catalog-verify cycle to heal.
 migrate_to_new_archive_path() {
-  local old_path="${PGBACKREST_REPO1_PATH}"
+  GAP_STATE_DIAG="wal-regression"
+
+  # PGBACKREST_REPO1_PATH is normally set by wrapper.sh's exec env and
+  # refreshed every iteration by sync_repo_path_from_marker, but a missing
+  # marker + missing env would trip `set -u` below. Bail with a clear log
+  # rather than aborting the watcher iteration mid-flow.
+  if [ -z "${PGBACKREST_REPO1_PATH:-}" ]; then
+    log "wal-regression: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate"
+    return 1
+  fi
 
   # Track the pre-migration path so successive migrations land at
   # cluster-SYSID-<epoch1>, cluster-SYSID-<epoch2>, … rather than chaining
@@ -536,18 +552,28 @@ migrate_to_new_archive_path() {
   local orig_path
   orig_path=$(read_state wal_regression_orig_path)
   if [ -z "$orig_path" ]; then
-    orig_path="${PGBACKREST_REPO1_PATH}"
+    orig_path="$PGBACKREST_REPO1_PATH"
     write_state_field wal_regression_orig_path "$orig_path"
   fi
 
-  local new_path="${orig_path}-$(date +%s)"
+  # Reuse the pending new_path from a prior failed attempt if present —
+  # otherwise apply_active_path failures (mktemp/mv on disk-full or
+  # permission errors) would compute a fresh `date +%s` every iteration and
+  # accumulate orphaned cluster-X-<epochN> siblings until the underlying
+  # condition cleared.
+  local new_path
+  new_path=$(read_state wal_regression_pending_new_path)
+  if [ -z "$new_path" ]; then
+    new_path="${orig_path}-$(date +%s)"
+    write_state_field wal_regression_pending_new_path "$new_path"
+  fi
 
-  log "wal-regression: migrating archive path (${old_path} → ${new_path}); old backups preserved at former path"
+  log "wal-regression: migrating archive path (${PGBACKREST_REPO1_PATH} → ${new_path}); old backups preserved at former path"
 
   # Reset backup-tracking + recovery state BEFORE flipping the marker. If
   # this function is interrupted partway through, the next iteration sees
-  # marker=OLD with last_full_at="" and re-fires migrate (with a fresh
-  # epoch suffix) instead of getting stuck at a half-migrated state.
+  # marker=OLD with last_full_at="" and re-fires migrate (reusing the
+  # persisted pending new_path) instead of getting stuck half-migrated.
   # Refresh stats so last_full_failed_count anchors at the current failed
   # count — matches clear_gap_recovery_state's semantics so a re-detection
   # immediately after migrate doesn't trip on a stale 0 anchor.
@@ -560,14 +586,15 @@ migrate_to_new_archive_path() {
   write_state_field last_force_recovery_at 0
   write_state_field force_attempts 0
 
-  # Commit point: marker + conf + env in lockstep. Marker-flip is what
-  # mono's restore picker actually reads (it inspects the marker and
-  # exports PGBACKREST_REPO1_PATH for its `pgbackrest info` calls); the
-  # conf rewrite is defense-in-depth for bare-shell diagnostics.
   if ! apply_active_path "$new_path"; then
     log "wal-regression: failed to apply new archive path (${new_path}); will retry"
     return 1
   fi
+
+  # Marker flipped successfully — clear the pending field so the next
+  # WAL_REGRESSION (a *new* rollback, not a retry of this one) computes a
+  # fresh epoch.
+  write_state_field wal_regression_pending_new_path ""
 
   # Force-respawn the async daemon. pgBackRest's async worker reads its
   # repo1-path once at fork/exec time and holds it for the daemon's
@@ -652,7 +679,6 @@ gap_recovery_step() {
     d_tl="${dup_seg:0:8}"; c_tl="${catalog_max:0:8}"
     d_n=$(segment_to_number "$dup_seg"); c_n=$(segment_to_number "$catalog_max")
     if [ "$d_tl" = "$c_tl" ] && [ -n "$d_n" ] && [ -n "$c_n" ] && [ "$d_n" -le "$c_n" ]; then
-      GAP_STATE_DIAG="wal-regression"
       log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max}) — self-healing"
       migrate_to_new_archive_path
       return 0
@@ -738,7 +764,6 @@ gap_recovery_step() {
           wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
           wr_c_n=$(segment_to_number "$catalog_max")
           if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-            GAP_STATE_DIAG="wal-regression"
             log "wal-regression: detected after ${force_attempts} pkill attempts (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}) — self-healing"
             migrate_to_new_archive_path
             return 0
@@ -797,7 +822,6 @@ gap_recovery_step() {
         wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
         wr_c_n=$(segment_to_number "$catalog_max")
         if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-          GAP_STATE_DIAG="wal-regression"
           log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
           migrate_to_new_archive_path
           return 0
