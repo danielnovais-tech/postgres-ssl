@@ -1915,10 +1915,29 @@ t_watcher_wal_regression_async_spool_probe() {
   local orig_path orig_full_count last_archived
   orig_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
   orig_full_count=$(count_backups_of_type "$name" full)
-  last_archived=$(docker exec "$name" psql -U postgres -At \
-    -c "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null)
+
+  # After a full backup pgBackRest archives a backup history file
+  # (e.g. 000000010000000000000003.00000028.backup) via archive_command, and
+  # pg_stat_archiver reflects it as last_archived_wal. That name is not a
+  # plain 24-char WAL segment, so segment_to_number rejects it and the
+  # probe_async_duplicate_error boundary check fails silently. Force a WAL
+  # switch here so the next archived file is a real segment, then poll until
+  # last_archived_wal is exactly 24 hex chars before planting the .error.
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  local seg_deadline=$(($(date +%s) + 20))
+  last_archived=""
+  while [ "$(date +%s)" -lt "$seg_deadline" ]; do
+    local candidate
+    candidate=$(docker exec "$name" psql -U postgres -At \
+      -c "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null)
+    if [ "${#candidate}" -eq 24 ]; then
+      last_archived="$candidate"
+      break
+    fi
+    sleep 1
+  done
   if [ -z "$last_archived" ]; then
-    ko t_watcher_wal_regression_async_spool_probe "no last_archived_wal after initial full"
+    ko t_watcher_wal_regression_async_spool_probe "no 24-char WAL segment in last_archived_wal after pg_switch_wal"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
   fi
