@@ -467,12 +467,23 @@ apply_active_path() {
 # checksum" → …) and matching it would silently disarm on the next rename.
 probe_async_duplicate_error() {
   [ -d "$SPOOL_ERR_DIR" ] || return 1
-  local err_file first_line
+  local err_file first_line base
   for err_file in "$SPOOL_ERR_DIR"/*.error; do
     [ -f "$err_file" ] || continue
+    # Skip non-WAL-segment errors (backup history files like
+    # <wal>.<offset>.backup also archive through this path and produce
+    # <name>.backup.error on exit 45). Without this filter, an
+    # alphabetically-earlier .backup.error would short-circuit the loop
+    # before reaching a real WAL-segment .error, the predicate's
+    # segment_to_number would reject the 31-char name and return empty,
+    # and migration would silently fail to fire that iteration. Same
+    # strict shape as segment_to_number's input check.
+    base=$(basename "$err_file" .error)
+    [ ${#base} -eq 24 ] || continue
+    case "$base" in *[!0-9A-Fa-f]*) continue ;; esac
     IFS= read -r first_line < "$err_file" 2>/dev/null || continue
     if [ "$first_line" = "45" ]; then
-      basename "$err_file" .error
+      echo "$base"
       return 0
     fi
   done
@@ -709,6 +720,14 @@ gap_recovery_step() {
       # `-le` (not `-lt`) covers the boundary case where rollback lands
       # exactly at the last successfully archived segment and postgres
       # re-pushes that same segment number with different content.
+      #
+      # Failsafe behind probe_async_duplicate_error above — which converges
+      # in one poll cycle and doesn't need pg_stat_archiver to be populated
+      # — so in steady state this branch is dead. It survives for the case
+      # where the .error files got cleaned between iterations (kick races,
+      # operator pkill, async daemon restarted by something else) and the
+      # spool probe finds nothing, but pg_stat_archiver still reflects the
+      # underlying failure.
       if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
          && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
         local wr_ftl wr_ctlmax_tl
