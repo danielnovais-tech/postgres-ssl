@@ -608,15 +608,23 @@ migrate_to_new_archive_path() {
   # archive-push respawns the daemon with the new env / new conf.
   log "wal-regression: kicking async daemon to pick up new repo1-path"
   kick_async_daemon
+  # Wait up to 2s for the daemon to actually exit before cleaning spool
+  # files. pkill(1) is non-blocking — in the window between signal delivery
+  # and process exit the daemon's shutdown path can write a new .error file,
+  # which would survive the rm below and cause probe_async_duplicate_error
+  # to re-fire migration on the very next poll.
+  local _drain_deadline=$(($(date +%s) + 2))
+  while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
+        && [ "$(date +%s)" -lt "$_drain_deadline" ]; do
+    sleep 0.2
+  done
 
   # Stale .error files in the async spool reference segments on the OLD
   # path — the conflict that produced them doesn't exist at the new
   # (empty) path. Without cleanup the next iteration's
   # probe_async_duplicate_error would re-fire migration on leftovers.
   # The spool is a coordination cache, never durable data — async
-  # re-uploads from pg_wal on next call. Cleanup runs AFTER the kick so
-  # any final flush from the dying daemon doesn't recreate the file
-  # we're about to delete.
+  # re-uploads from pg_wal on next call.
   rm -f "$SPOOL_ERR_DIR"/*.error 2>/dev/null || true
 
   # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
@@ -671,15 +679,31 @@ gap_recovery_step() {
   # invocation. On a quiet DB the next invocation may be a long way off, and
   # without a foreground-side failure LAST_FAILED_WAL is NULL and the
   # downstream regression detection can't fire. Read the spool directly so
-  # an async-only wedge converges in one poll cycle. Same predicate
-  # semantics: same timeline, failed segment ≤ catalog max.
+  # an async-only wedge converges in one poll cycle.
   local dup_seg
-  if dup_seg=$(probe_async_duplicate_error) && [ -n "$catalog_max" ] && [ -n "$dup_seg" ]; then
-    local d_tl c_tl d_n c_n
-    d_tl="${dup_seg:0:8}"; c_tl="${catalog_max:0:8}"
-    d_n=$(segment_to_number "$dup_seg"); c_n=$(segment_to_number "$catalog_max")
-    if [ "$d_tl" = "$c_tl" ] && [ -n "$d_n" ] && [ -n "$c_n" ] && [ "$d_n" -le "$c_n" ]; then
-      log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max}) — self-healing"
+  if dup_seg=$(probe_async_duplicate_error) && [ -n "$dup_seg" ]; then
+    local d_tl d_n
+    d_tl="${dup_seg:0:8}"
+    d_n=$(segment_to_number "$dup_seg")
+    # When catalog_max is available, verify the failing segment is on the same
+    # timeline and at or before the S3 max — guards against a stale .error
+    # written on a different timeline. When catalog_max is empty
+    # (LAST_ARCHIVED_WAL unset after a postgres restart — exactly the
+    # post-rollback scenario this probe is designed for), trust the exit-45
+    # evidence directly: a segment already present in S3 at a different
+    # checksum is self-evident proof of WAL_REGRESSION regardless of what
+    # pgbackrest info can currently enumerate.
+    local _dup_ok=0
+    if [ -z "$catalog_max" ]; then
+      [ -n "$d_n" ] && _dup_ok=1
+    else
+      local _c_tl _c_n
+      _c_tl="${catalog_max:0:8}"; _c_n=$(segment_to_number "$catalog_max")
+      [ "$d_tl" = "$_c_tl" ] && [ -n "$d_n" ] && [ -n "$_c_n" ] \
+        && [ "$d_n" -le "$_c_n" ] && _dup_ok=1
+    fi
+    if [ "$_dup_ok" -eq 1 ]; then
+      log "wal-regression: async spool ArchiveDuplicateError for ${dup_seg} (catalog_max=${catalog_max:-unknown}) — self-healing"
       migrate_to_new_archive_path
       return 0
     fi
