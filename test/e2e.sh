@@ -2030,6 +2030,18 @@ EOF
     return
   fi
 
+  # Pending target must only clear after marker flip + async spool cleanup
+  # finalize successfully. If this sticks, a later iteration is expected to
+  # retry finalization rather than trusting stale old-path .ok/.error files.
+  local pending_in_state
+  pending_in_state=$(docker exec "$name" grep -E "^wal_regression_pending_new_path=" \
+    /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
+  if [ -n "$pending_in_state" ]; then
+    ko t_watcher_wal_regression_async_spool_probe "wal_regression_pending_new_path should be clear after finalize, got '${pending_in_state}'"
+    fail_dump t_watcher_wal_regression_async_spool_probe "$name"
+    return
+  fi
+
   # The rendered pgbackrest.conf must have repo1-path rewritten too —
   # defense for bare-shell diagnostics that don't go through the
   # PGBACKREST_REPO1_PATH env override that mono's picker uses.

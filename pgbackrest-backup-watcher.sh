@@ -357,20 +357,22 @@ segment_to_number() {
   echo $((log * SEGMENTS_PER_LOG_FILE + seg))
 }
 
-# Echoes the highest archived WAL segment on the same timeline as
-# LAST_ARCHIVED_WAL ("" if the catalog has no max for that timeline yet).
+# Echoes the highest archived WAL segment on the same timeline as the input
+# WAL (defaults to LAST_ARCHIVED_WAL; "" if the catalog has no max for that
+# timeline yet).
 # Returns 0 on a successful probe (including empty-result), 1 on transient
 # failure (pgbackrest info errored, JSON unparseable). The previous version
 # silently collapsed unparseable output into "lag=0" — that's the bug that
 # masked Nexa/Postgres-2xa1 and ERP-3.0 at 250+ segments lag while the
 # watcher reported lag=0. jq either parses or fails loudly; no quiet zero.
 probe_catalog_max() {
-  [ -z "$LAST_ARCHIVED_WAL" ] && { echo ""; return 0; }
+  local wal_for_timeline="${1:-$LAST_ARCHIVED_WAL}"
+  [ -z "$wal_for_timeline" ] && { echo ""; return 0; }
   local info_out
   info_out=$(timeout 30 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
   [ -z "$info_out" ] && return 1
 
-  local tl="${LAST_ARCHIVED_WAL:0:8}"
+  local tl="${wal_for_timeline:0:8}"
   local repo_max
   repo_max=$(printf '%s' "$info_out" | jq -r --arg tl "$tl" '
     [ .[]?.archive[]?.max // empty
@@ -384,6 +386,20 @@ probe_catalog_max() {
 
   echo "$repo_max"
   return 0
+}
+
+# Returns a catalog max suitable for comparing against a specific WAL file.
+# If the already-probed catalog_max is empty or on another timeline (common
+# after postgres restart, when pg_stat_archiver.last_archived_wal is unset),
+# re-probe pgBackRest using the WAL's timeline explicitly.
+catalog_max_for_wal() {
+  local wal="$1" current="${2:-}"
+  [ -z "$wal" ] && { echo ""; return 0; }
+  if [ -n "$current" ] && [ "${current:0:8}" = "${wal:0:8}" ]; then
+    echo "$current"
+    return 0
+  fi
+  probe_catalog_max "$wal"
 }
 
 # Clears all gap-recovery state (marker file + state fields). Called after a
@@ -513,6 +529,59 @@ probe_async_duplicate_error() {
   return 1
 }
 
+write_state_field_required() {
+  local field="$1" value="$2"
+  if ! write_state_field "$field" "$value"; then
+    log "state-write: failed to persist ${field}; refusing unsafe archive-path migration step"
+    return 1
+  fi
+  return 0
+}
+
+# Finalizes a marker-flipped WAL_REGRESSION migration by forcing pgBackRest's
+# async daemon to re-read repo1-path and clearing stale async status files from
+# the old path. Only clear wal_regression_pending_new_path after this succeeds;
+# a crash before cleanup leaves the pending field in place so the next watcher
+# iteration retries this finalization instead of trusting stale .ok/.error files.
+finalize_wal_regression_migration() {
+  local path="$1"
+
+  log "wal-regression: kicking async daemon to pick up new repo1-path"
+  kick_async_daemon
+  # Wait up to 2s for the daemon to actually exit before cleaning spool
+  # files. pkill(1) is non-blocking — in the window between signal delivery
+  # and process exit the daemon's shutdown path can write a new .error file,
+  # which would survive the rm below and cause probe_async_duplicate_error
+  # to re-fire migration on the very next poll.
+  local _drain_deadline=$(($(date +%s) + 2))
+  while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
+        && [ "$(date +%s)" -lt "$_drain_deadline" ]; do
+    sleep 0.2
+  done
+
+  # Stale async status files reference segments on the OLD path — the
+  # conflict that produced .error files doesn't exist at the new (empty)
+  # path, and .ok files can incorrectly satisfy future archive-push calls
+  # without uploading the segment to the NEW path. The spool is a coordination
+  # cache, never durable data — async re-uploads from pg_wal on next call.
+  if ! rm -f "$SPOOL_ERR_DIR"/*.error "$SPOOL_ERR_DIR"/*.ok 2>/dev/null; then
+    log "wal-regression: failed to clean async status files; will retry finalization"
+    return 1
+  fi
+
+  # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
+  # GAP_MARKER gate in decide_action, so its presence here wouldn't block
+  # the post-migrate full — removing it is purely tidiness.
+  rm -f "$GAP_MARKER"
+
+  if ! write_state_field wal_regression_pending_new_path ""; then
+    log "wal-regression: failed to clear pending migration marker; will retry finalization"
+    return 1
+  fi
+
+  log "wal-regression: migration finalized at ${path}; async status cache cleared"
+}
+
 # Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
 # path suffix (e.g. cluster-SYSID → cluster-SYSID-<epoch>). WAL_REGRESSION
 # occurs when a volume snapshot rollback restores the data directory to an
@@ -565,7 +634,7 @@ migrate_to_new_archive_path() {
   orig_path=$(read_state wal_regression_orig_path)
   if [ -z "$orig_path" ]; then
     orig_path="$PGBACKREST_REPO1_PATH"
-    write_state_field wal_regression_orig_path "$orig_path"
+    write_state_field_required wal_regression_orig_path "$orig_path" || return 1
   fi
 
   # Reuse the pending new_path from a prior failed attempt if present —
@@ -577,7 +646,17 @@ migrate_to_new_archive_path() {
   new_path=$(read_state wal_regression_pending_new_path)
   if [ -z "$new_path" ]; then
     new_path="${orig_path}-$(date +%s)"
-    write_state_field wal_regression_pending_new_path "$new_path"
+    write_state_field_required wal_regression_pending_new_path "$new_path" || return 1
+  fi
+
+  # Previous iteration may have flipped the marker and crashed before clearing
+  # stale spool statuses / pending state. Do not compute a new path; finish the
+  # pending migration first so stale .ok files cannot mask missing uploads at
+  # the new path.
+  if [ "$PGBACKREST_REPO1_PATH" = "$new_path" ]; then
+    log "wal-regression: finalizing pending archive-path migration at ${new_path}"
+    finalize_wal_regression_migration "$new_path"
+    return $?
   fi
 
   log "wal-regression: migrating archive path (${PGBACKREST_REPO1_PATH} → ${new_path}); old backups preserved at former path"
@@ -588,60 +667,27 @@ migrate_to_new_archive_path() {
   # persisted pending new_path) instead of getting stuck half-migrated.
   # Refresh stats so last_full_failed_count anchors at the current failed
   # count — matches clear_gap_recovery_state's semantics so a re-detection
-  # immediately after migrate doesn't trip on a stale 0 anchor.
+  # immediately after migrate doesn't trip on a stale 0 anchor. These writes
+  # are load-bearing for the post-migrate NEEDS_INITIAL_BACKUP; if any fail,
+  # abort before marker flip rather than entering the new empty path with stale
+  # state.
   refresh_archiver_stats || true
-  write_state_field last_full_failed_count "${FAILED_COUNT:-0}"
-  write_state_field last_full_at ""
-  write_state_field last_diff_at ""
-  write_state_field last_lag_detected_at 0
-  write_state_field catalog_max_at_detection ""
-  write_state_field last_force_recovery_at 0
-  write_state_field force_attempts 0
+  write_state_field_required last_full_failed_count "${FAILED_COUNT:-0}" || return 1
+  write_state_field_required last_full_at "" || return 1
+  write_state_field_required last_diff_at "" || return 1
+  write_state_field_required last_lag_detected_at 0 || return 1
+  write_state_field_required catalog_max_at_detection "" || return 1
+  write_state_field_required last_force_recovery_at 0 || return 1
+  write_state_field_required force_attempts 0 || return 1
 
   if ! apply_active_path "$new_path"; then
     log "wal-regression: failed to apply new archive path (${new_path}); will retry"
     return 1
   fi
 
-  # Marker flipped successfully — clear the pending field so the next
-  # WAL_REGRESSION (a *new* rollback, not a retry of this one) computes a
-  # fresh epoch.
-  write_state_field wal_regression_pending_new_path ""
-
-  # Force-respawn the async daemon. pgBackRest's async worker reads its
-  # repo1-path once at fork/exec time and holds it for the daemon's
-  # lifetime — config rewrites and env changes do NOT propagate to a
-  # running daemon. Without this kick the OLD async daemon keeps draining
-  # the spool to the OLD path long after the marker flips, the
-  # post-migrate full's closing WAL never reaches the NEW path, and
-  # self-heal stalls until the regular gap-recovery loop pkills it
-  # (~GAP_RECOVERY_BACKOFF_SECONDS, default 10 min). pkill here drops
-  # that window to ~archive_timeout (default 60s) — the next foreground
-  # archive-push respawns the daemon with the new env / new conf.
-  log "wal-regression: kicking async daemon to pick up new repo1-path"
-  kick_async_daemon
-  # Wait up to 2s for the daemon to actually exit before cleaning spool
-  # files. pkill(1) is non-blocking — in the window between signal delivery
-  # and process exit the daemon's shutdown path can write a new .error file,
-  # which would survive the rm below and cause probe_async_duplicate_error
-  # to re-fire migration on the very next poll.
-  local _drain_deadline=$(($(date +%s) + 2))
-  while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
-        && [ "$(date +%s)" -lt "$_drain_deadline" ]; do
-    sleep 0.2
-  done
-
-  # Stale async status files reference segments on the OLD path — the
-  # conflict that produced .error files doesn't exist at the new (empty)
-  # path, and .ok files can incorrectly satisfy future archive-push calls
-  # without uploading the segment to the NEW path. The spool is a coordination
-  # cache, never durable data — async re-uploads from pg_wal on next call.
-  rm -f "$SPOOL_ERR_DIR"/*.error "$SPOOL_ERR_DIR"/*.ok 2>/dev/null || true
-
-  # Clear the recovery sentinel last. NEEDS_INITIAL_BACKUP fires above the
-  # GAP_MARKER gate in decide_action, so its presence here wouldn't block
-  # the post-migrate full — removing it is purely tidiness.
-  rm -f "$GAP_MARKER"
+  if ! finalize_wal_regression_migration "$new_path"; then
+    return 1
+  fi
 
   log "wal-regression: state reset; next iteration will initialize stanza and take full backup at ${new_path}"
 }
@@ -771,17 +817,16 @@ gap_recovery_step() {
       # operator pkill, async daemon restarted by something else) and the
       # spool probe finds nothing, but pg_stat_archiver still reflects the
       # underlying failure.
-      if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
+      if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] \
          && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
-        local wr_ftl wr_ctlmax_tl
-        wr_ftl="${LAST_FAILED_WAL:0:8}"
-        wr_ctlmax_tl="${catalog_max:0:8}"
-        if [ "$wr_ftl" = "$wr_ctlmax_tl" ]; then
+        local wr_catalog_max
+        wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
+        if [ -n "$wr_catalog_max" ]; then
           local wr_f_n wr_c_n
           wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-          wr_c_n=$(segment_to_number "$catalog_max")
+          wr_c_n=$(segment_to_number "$wr_catalog_max")
           if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-            log "wal-regression: detected after ${force_attempts} pkill attempts (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}) — self-healing"
+            log "wal-regression: detected after ${force_attempts} pkill attempts (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}) — self-healing"
             migrate_to_new_archive_path
             return 0
           fi
@@ -829,17 +874,16 @@ gap_recovery_step() {
     # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
     # currently active, not a stale pg_stat_archiver.last_failed_wal from an
     # old transient error (those fields are sticky until postgres restart).
-    if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
+    if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
        && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
-      local wr_ftl wr_ctlmax_tl
-      wr_ftl="${LAST_FAILED_WAL:0:8}"
-      wr_ctlmax_tl="${catalog_max:0:8}"
-      if [ "$wr_ftl" = "$wr_ctlmax_tl" ]; then
+      local wr_catalog_max
+      wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
+      if [ -n "$wr_catalog_max" ]; then
         local wr_f_n wr_c_n
         wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-        wr_c_n=$(segment_to_number "$catalog_max")
+        wr_c_n=$(segment_to_number "$wr_catalog_max")
         if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-          log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
+          log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
           migrate_to_new_archive_path
           return 0
         fi
