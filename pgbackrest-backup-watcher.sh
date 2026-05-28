@@ -139,6 +139,22 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       proof is "current catalog_max > this")
 #   last_force_recovery_at=<epoch>   — last time we pkill'd the async daemon
 #   force_attempts=<int>             — pkill cycles this gap-recovery cycle
+#   probe_fail_since=<epoch>         — epoch when pgbackrest info first failed
+#                                       in the current consecutive-failure run
+#                                       (0 = probes are succeeding). Reset to 0
+#                                       on any successful probe. Used by the
+#                                       S3-blind-spot kick: if probes have been
+#                                       failing for > GAP_RECOVERY_BACKOFF_SECONDS
+#                                       AND pg_stat_archiver shows WAL advancing,
+#                                       pkill the async daemon without S3
+#                                       confirmation — the probe blackout itself
+#                                       is evidence the async worker may be wedged
+#                                       on a hung S3 connection.
+#   probe_fail_archived_at_start=<int> — ARCHIVED_COUNT snapshot taken when the
+#                                       consecutive-failure run began. If count
+#                                       has grown since then, postgres is still
+#                                       handing WAL to the spool while S3 is dark
+#                                       — strengthens the kick signal.
 #   wal_regression_orig_path=<path>  — pre-migration repo1-path, set on the
 #                                       first WAL_REGRESSION self-heal and
 #                                       never cleared. Successive migrations
@@ -758,9 +774,53 @@ gap_recovery_step() {
   local probe_rc=$?
   if [ "$probe_rc" -ne 0 ]; then
     GAP_STATE_DIAG="probe-failed"
-    log "gap-recovery: pgbackrest info probe failed; leaving state unchanged"
+
+    # S3 blind-spot kick: the lag probe requires S3 reads to work. When S3 is
+    # completely unreachable (e.g. Tigris outage), probe_catalog_max times out
+    # on every iteration — LAST_OBSERVED_LAG_SEGMENTS stays at its stale value
+    # and the normal lag-threshold path never triggers, even though the async
+    # worker may be wedged on a hung PUT to the same unreachable endpoint.
+    #
+    # Mitigation: track how long probes have been continuously failing. If the
+    # blackout exceeds GAP_RECOVERY_BACKOFF_SECONDS AND pg_stat_archiver shows
+    # WAL is still being handed to the spool (ARCHIVED_COUNT grew since the
+    # blackout started), pkill the async daemon. The worker's hung connection
+    # will be killed; on the next WAL switch archive_command respawns the async
+    # process, which will retry the upload once S3 recovers.
+    #
+    # This does NOT touch the gap marker or enter the full gap-recovery state
+    # machine — catalog proof of S3 progress is still required to clear any
+    # existing marker. This is purely a "kick the stuck process" heuristic for
+    # the total-S3-outage scenario.
+    local probe_fail_since probe_fail_archived
+    probe_fail_since=$(read_state probe_fail_since); : "${probe_fail_since:=0}"
+    probe_fail_archived=$(read_state probe_fail_archived_at_start); : "${probe_fail_archived:=0}"
+
+    if [ "$probe_fail_since" -eq 0 ]; then
+      write_state_field probe_fail_since "$now"
+      write_state_field probe_fail_archived_at_start "${ARCHIVED_COUNT:-0}"
+      log "gap-recovery: pgbackrest info probe failed; leaving state unchanged (probe blackout started)"
+    else
+      local blackout_s=$(( now - probe_fail_since ))
+      local archived_grew=0
+      [ "${ARCHIVED_COUNT:-0}" -gt "$probe_fail_archived" ] && archived_grew=1
+      log "gap-recovery: pgbackrest info probe failed; leaving state unchanged (blackout=${blackout_s}s, archived_grew=${archived_grew})"
+
+      if [ "$blackout_s" -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ] && [ "$archived_grew" -eq 1 ]; then
+        log "gap-recovery: S3 unreachable for ${blackout_s}s while postgres keeps handing WAL — kicking async daemon (blind-spot kick)"
+        kick_async_daemon
+        # Reset the blackout clock so we don't kick on every subsequent
+        # probe-fail iteration; the next kick fires after another full backoff.
+        write_state_field probe_fail_since "$now"
+        write_state_field probe_fail_archived_at_start "${ARCHIVED_COUNT:-0}"
+      fi
+    fi
     return 0
   fi
+
+  # Probe succeeded — reset the consecutive-failure tracking.
+  write_state_field probe_fail_since 0
+  write_state_field probe_fail_archived_at_start 0
   LAST_LAG_REPO_MAX="$catalog_max"
 
   # Lag (postgres handoff minus catalog max). 0 if either side missing.
