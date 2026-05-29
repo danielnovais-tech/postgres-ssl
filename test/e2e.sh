@@ -2000,7 +2000,17 @@ EOF
   # closing WAL reaches the NEW path on the next archive_command (~60s),
   # not after a 10-min gap-recovery loop pkill. Without this, the daemon
   # holds the OLD repo1-path for its lifetime and self-heal stalls.
-  if ! docker logs "$name" 2>&1 | grep -q "wal-regression: kicking async daemon"; then
+  # Poll briefly: between "migrating" and "kicking" the watcher runs a
+  # psql round-trip + several state writes, so the kick log can lag the
+  # migration log by a few seconds on a loaded CI runner.
+  local kick_deadline=$(($(date +%s) + 15)) hit_kick=0
+  while [ "$(date +%s)" -lt "$kick_deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "wal-regression: kicking async daemon"; then
+      hit_kick=1; break
+    fi
+    sleep 1
+  done
+  if [ "$hit_kick" != "1" ]; then
     ko t_watcher_wal_regression_async_spool_probe "migrate did not kick the async daemon (kick log line missing)"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
