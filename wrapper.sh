@@ -497,13 +497,6 @@ render_pgbackrest_conf() {
     retention_block="repo1-retention-full=${retention_full}"$'\n'"repo1-retention-diff=${retention_diff}"$'\n'
   fi
 
-  # pgBackRest's repo1-s3-endpoint config option expects a bare hostname; it
-  # rejects values with a protocol prefix (https:// or http://) and exits
-  # immediately with a config validation error. Strip the prefix here so
-  # BYOB customers who set WAL_ARCHIVE_ENDPOINT=https://... get a valid conf.
-  local wal_archive_endpoint_stripped="${WAL_ARCHIVE_ENDPOINT#https://}"
-  wal_archive_endpoint_stripped="${wal_archive_endpoint_stripped#http://}"
-
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
@@ -511,7 +504,7 @@ repo1-s3-bucket=${WAL_ARCHIVE_BUCKET}
 repo1-s3-key=${WAL_ARCHIVE_KEY}
 repo1-s3-key-secret=${WAL_ARCHIVE_SECRET}
 repo1-s3-region=${WAL_ARCHIVE_REGION}
-repo1-s3-endpoint=${wal_archive_endpoint_stripped}
+repo1-s3-endpoint=${WAL_ARCHIVE_ENDPOINT}
 repo1-s3-uri-style=${WAL_ARCHIVE_S3_URI_STYLE:-path}
 repo1-path=${WAL_ARCHIVE_PATH:-/pgbackrest}
 log-level-console=info
