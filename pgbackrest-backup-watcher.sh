@@ -269,9 +269,11 @@ run_backup() {
       # last_full_failed_count itself — folds failures-during-backup into
       # the anchor so the next iteration doesn't re-fire detection.
       clear_gap_recovery_state "cleared by full backup"
+      write_state_field startup_diff_pending "0"
       ;;
     diff|incr)
       write_state_field last_diff_at "$now"
+      write_state_field startup_diff_pending "0"
       ;;
   esac
   log "backup --type=$type completed"
@@ -1119,6 +1121,18 @@ decide_action() {
     DECIDED_ACTION="full"; return 0
   fi
 
+  # Startup diff — fires once per container restart (startup_diff_pending is
+  # written before the loop and cleared in run_backup). Sealed by the first
+  # successful backup of any type; cleared even if a full ran above. Ensures
+  # WAL lost at the crash boundary is sealed before the next periodic diff
+  # would otherwise fire — pg_stat_archiver resets on restart so the
+  # lag-detection state machine cannot see pre-crash historical gaps.
+  local startup_diff_pending
+  startup_diff_pending=$(read_state startup_diff_pending)
+  if [ "${startup_diff_pending:-0}" = "1" ] && [ -n "$last_full" ]; then
+    DECIDED_ACTION="diff"; return 0
+  fi
+
   # Periodic diff.
   if [ "$DIFF_INTERVAL_SECONDS" -gt 0 ]; then
     local diff_anchor="${last_diff:-$last_full}"
@@ -1228,6 +1242,14 @@ sync_repo_path_from_marker() {
 }
 
 sync_repo_path_from_marker
+
+# Mark that a startup diff is pending. Cleared on first successful backup so
+# it never fires twice in the same watcher run. Intent: trigger a diff on the
+# first poll after any container restart so that WAL lost at the crash boundary
+# (unarchiveable after crash recovery — postgres advances past those positions
+# and recycles the segment files) is sealed as quickly as possible rather than
+# waiting for the periodic diff interval to elapse.
+write_state_field startup_diff_pending "1"
 
 log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_backoff=${GAP_RECOVERY_BACKOFF_SECONDS}s, lag_threshold=${WAL_LAG_GAP_THRESHOLD_SEGMENTS} segments, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
