@@ -347,6 +347,22 @@ log_catalog_probe_error() {
   log "catalog probe diagnostic: pgbackrest info exited rc=${rc}; stderr: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
 }
 
+# Runs pgbackrest stanza-create every watcher iteration. stanza-create is
+# idempotent: when the stanza already exists and backup.info is valid, it does
+# a couple of S3 reads and exits 0 (silent). It only writes when backup.info is
+# missing or corrupt — exactly the rc=2 deadlock scenario. Running it every
+# iteration decouples stanza repair from the catalog-verify interval so a broken
+# stanza is fixed on the next poll (~60s) rather than waiting up to
+# CATALOG_VERIFY_INTERVAL_SECONDS (default 1h). Logs only on failure.
+stanza_create_step() {
+  local out rc
+  out=$(timeout 60 pgbackrest --stanza=main stanza-create 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "stanza-create: exited rc=${rc}; $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+  fi
+}
+
 # LAST_OBSERVED_LAG_SEGMENTS / LAST_LAG_REPO_MAX surface the most recent
 # observation to watcher_iteration's diagnostic log line.
 LAST_OBSERVED_LAG_SEGMENTS=0
@@ -1173,9 +1189,8 @@ decide_action() {
       if [ "$full_attempt_ok" -eq 1 ]; then DECIDED_ACTION="full"; return 0; fi
       DECIDED_ACTION=""; return 0
     else
-      log "catalog check inconclusive (pgbackrest info errored); logging probe error + running idempotent stanza-create"
+      log "catalog check inconclusive (pgbackrest info errored); logging probe error (stanza-create ran this iteration)"
       log_catalog_probe_error
-      pgbackrest --stanza=main stanza-create 2>&1 | while IFS= read -r _l; do log "stanza-create: ${_l}"; done
     fi
   fi
 
@@ -1257,6 +1272,12 @@ watcher_iteration() {
   # segsize. Failure leaves the previous value in place; the watcher
   # never sees an arithmetic crash from a missing global.
   refresh_wal_segment_size || true
+
+  # Idempotent stanza health — every iteration. A no-op (2 S3 reads) when the
+  # stanza is healthy; repairs a missing or corrupt backup.info on the spot.
+  # Running every iteration means a broken stanza is fixed on the next poll
+  # rather than waiting up to CATALOG_VERIFY_INTERVAL_SECONDS.
+  stanza_create_step
 
   # Gap-recovery state machine — detects WAL/catalog divergence and drives
   # the kick-and-diff sequence. Runs every iteration; pgbackrest info is
