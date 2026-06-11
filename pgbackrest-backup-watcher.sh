@@ -107,20 +107,14 @@ DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 # fresh state). Default: 3600 (1 hour).
 CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
 
-# Catalog-verify deadlock breaker (seconds). catalog_check_backup returns rc=2
-# (inconclusive) for ANY non-zero `pgbackrest info` — S3 outage, auth failure,
-# OR a backup.info that pgBackRest rejects after an interrupted first full
-# (redeploy racing the initial backup). The verify path treats rc=2 as
-# transient and never clears the stale last_full_at, so the self-heal that
-# re-takes the first full (rc=1 path) can never fire: WAL keeps archiving while
-# fullCount stays 0 forever, surfaced only as LOG_SPEW. Distinguishing a real
-# S3 outage from a permanent rejected-catalog: during an outage archiving also
-# stops, so ARCHIVED_COUNT is flat; a rejected backup.info keeps WAL flowing
-# (heartbeat → archive_timeout → push) and ARCHIVED_COUNT climbs. When rc=2 has
-# persisted this long AND ARCHIVED_COUNT grew over the window, treat the catalog
-# as broken (not S3 down): log the real `pgbackrest info` stderr, run
-# stanza-create, and clear last_full_at to re-fire NEEDS_INITIAL_BACKUP.
-CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS:-1800}"
+# Minimum spacing between full-backup *attempts* (seconds). NEEDS_INITIAL_BACKUP
+# and the catalog-verify rc=1 self-heal both clear/leave last_full_at empty,
+# which makes decide_action want a full every poll — so a full that keeps
+# FAILING (S3 down, broken backup.info) would hammer S3 with full-sized pushes
+# every ~60s. last_full_attempt_at is stamped at the start of each full, and
+# decide_action suppresses the next full until this much time has passed. The
+# first attempt on a fresh enable is never delayed (no prior attempt recorded).
+FULL_RETRY_BACKOFF_SECONDS="${WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS:-600}"
 
 # LSN-lag detection — see file header. Detection runs every iteration (no
 # probe throttle): `pgbackrest info` is local-to-S3 round-trip, ~50-200ms,
@@ -149,16 +143,12 @@ log() { echo "pgbackrest-watcher: $*"; }
 #   last_diff_at=<epoch>             — last successful diff/incr backup
 #   last_full_failed_count=<int>     — pg_stat_archiver.failed_count after last full
 #   last_catalog_verify_at=<epoch>   — last S3 catalog probe (catalog_check_backup)
-#   catalog_verify_inconclusive_since=<epoch>
-#                                    — epoch when catalog_check_backup first
-#                                      returned rc=2 in the current consecutive
-#                                      run (0 = last verify was conclusive).
-#                                      Reset to 0 on any rc=0/rc=1. Drives the
-#                                      deadlock breaker in decide_action.
-#   catalog_verify_inconclusive_archived_at_start=<int>
-#                                    — ARCHIVED_COUNT when the current rc=2 run
-#                                      began; growth since proves WAL is still
-#                                      reaching S3 (catalog broken, not S3 down).
+#   last_full_attempt_at=<epoch>     — epoch a full backup was last *attempted*
+#                                      (stamped at the start of run_backup full,
+#                                      success or fail). decide_action spaces
+#                                      successive full attempts at least
+#                                      FULL_RETRY_BACKOFF_SECONDS apart so a
+#                                      failing full doesn't hammer S3 every poll.
 #   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started
 #   catalog_max_at_detection=<wal>   — catalog max segment at detection (recovery
 #                                       proof is "current catalog_max > this")
@@ -264,6 +254,12 @@ is_standby() {
 run_backup() {
   local type="$1"
   log "running pgbackrest backup --type=$type"
+  # Stamp the attempt time up front (success or fail) so decide_action's
+  # FULL_RETRY_BACKOFF_SECONDS spacing applies to a full that keeps failing,
+  # rather than re-firing it every poll.
+  if [ "$type" = "full" ]; then
+    write_state_field last_full_attempt_at "$(date +%s)"
+  fi
   # --repo=1 scopes backup + post-backup expire to this service's own bucket.
   # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
   # would default to writing the new base into both repos.
@@ -1110,79 +1106,79 @@ decide_action() {
   # loudly instead of producing an unrestorable base — no need to gate on
   # "archive-push has worked once". Earlier the gate cost 60-120s of dead
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
+  # Full-attempt backoff. A full that keeps FAILING (S3 down, broken
+  # backup.info) would otherwise be re-attempted every poll once last_full is
+  # empty — hammering S3 with full-sized pushes. last_full_attempt_at is
+  # stamped at the START of every full in run_backup, so successive *attempts*
+  # are spaced at least FULL_RETRY_BACKOFF_SECONDS apart. The first attempt on
+  # a fresh enable fires immediately (no prior attempt recorded), so a healthy
+  # initial full is never delayed.
+  local last_full_attempt full_attempt_ok=1
+  last_full_attempt=$(read_state last_full_attempt_at)
+  if [ -n "$last_full_attempt" ] \
+     && [ $((now - last_full_attempt)) -lt "$FULL_RETRY_BACKOFF_SECONDS" ]; then
+    full_attempt_ok=0
+  fi
+
   if [ -z "$last_full" ]; then
-    DECIDED_ACTION="full"; return 0
+    if [ "$full_attempt_ok" -eq 1 ]; then DECIDED_ACTION="full"; return 0; fi
+    DECIDED_ACTION=""; return 0
   fi
 
   # Catalog verification — periodically confirm S3 actually has a full backup.
   # Catches divergence between local state and S3 reality: the backup command
   # may have returned exit 0 without committing catalog metadata (S3 partial
   # write, stanza-create race), or a volume survived a redeployment with stale
-  # state pointing at a different stanza/sysid path. Only clears state when the
-  # catalog explicitly confirms "no backup" (exit 0 + empty backup list); an
-  # unreachable S3 or missing stanza returns non-zero and is treated as
-  # inconclusive so we don't burn a full on every transient S3 hiccup.
+  # state pointing at a different stanza/sysid path.
+  #
+  # Three outcomes (catalog_check_backup):
+  #   rc=0 full present     → nothing to do.
+  #   rc=1 no full present   → conclusive (info succeeded, empty backup list).
+  #                            Clear last_full_at so NEEDS_INITIAL re-takes the
+  #                            full. Safe to act on a single rc=1 — it's a
+  #                            successful probe, so it can't be a transient.
+  #   rc=2 inconclusive      → info errored (S3 hiccup, auth, or a backup.info
+  #                            pgBackRest rejects). Don't clear last_full (that
+  #                            would burn a full on every transient hiccup, and
+  #                            transient info errors are common). Instead log
+  #                            the otherwise-swallowed stderr and run an
+  #                            idempotent stanza-create — cheap, and it repairs
+  #                            a missing/half-written backup.info so the *next*
+  #                            verify returns rc=1 and the clear path takes
+  #                            over. A truly-unreachable S3 makes stanza-create
+  #                            a no-op; nothing is burned.
+  #
+  # last_catalog_verify_at is stamped on ALL outcomes (including rc=2), so the
+  # probe — and the stanza-create — run at most once per interval rather than
+  # every poll. That bound is also what stops the rc=2 case from spewing a log
+  # line every 60s.
   local last_catalog_verify
   last_catalog_verify=$(read_state last_catalog_verify_at)
-  local needs_verify=0
-  if [ -z "$last_catalog_verify" ] || [ $((now - last_catalog_verify)) -ge "$CATALOG_VERIFY_INTERVAL_SECONDS" ]; then
-    needs_verify=1
-  fi
-  if [ "$needs_verify" -eq 1 ]; then
+  if [ "$CATALOG_VERIFY_INTERVAL_SECONDS" -gt 0 ] \
+     && { [ -z "$last_catalog_verify" ] || [ $((now - last_catalog_verify)) -ge "$CATALOG_VERIFY_INTERVAL_SECONDS" ]; }; then
     log "verifying S3 catalog has full backup"
     catalog_check_backup
     local _crc=$?
-    # Stamp the verify timestamp only on conclusive results (rc=0 full
-    # present, rc=1 no full present). On rc=2 (inconclusive — S3 hiccup,
-    # stanza not yet created) leave the timestamp untouched so the next
-    # iteration retries instead of locking out the verify for an hour.
+    write_state_field last_catalog_verify_at "$now"
     if [ "$_crc" -eq 0 ]; then
-      write_state_field last_catalog_verify_at "$now"
-      write_state_field catalog_verify_inconclusive_since 0
       log "catalog verified — full backup present in S3"
-    elif [ "$_crc" -eq 2 ]; then
-      # Inconclusive. Track how long this consecutive rc=2 run has lasted and
-      # whether archiving kept advancing through it. A real S3 outage freezes
-      # both the probe AND archive-push, so ARCHIVED_COUNT stays flat; a
-      # backup.info pgBackRest rejects (interrupted first full) keeps WAL
-      # flowing while the probe stays broken. Only the latter is a deadlock we
-      # can break — re-taking the first full is futile if S3 is actually down.
-      local incon_since incon_archived
-      incon_since=$(read_state catalog_verify_inconclusive_since); : "${incon_since:=0}"
-      incon_archived=$(read_state catalog_verify_inconclusive_archived_at_start); : "${incon_archived:=0}"
-      if [ "$incon_since" -eq 0 ]; then
-        write_state_field catalog_verify_inconclusive_since "$now"
-        write_state_field catalog_verify_inconclusive_archived_at_start "${ARCHIVED_COUNT:-0}"
-        log "catalog check inconclusive (S3 unreachable or backup.info not readable); skipping (run started)"
-      else
-        local incon_for=$(( now - incon_since ))
-        local archived_grew=0
-        [ "${ARCHIVED_COUNT:-0}" -gt "$incon_archived" ] && archived_grew=1
-        if [ "$incon_for" -ge "$CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS" ] && [ "$archived_grew" -eq 1 ]; then
-          log "catalog check inconclusive for ${incon_for}s while WAL keeps archiving (archived ${incon_archived}→${ARCHIVED_COUNT:-0}) — backup.info is broken, not S3 down; self-healing"
-          log_catalog_probe_error
-          pgbackrest --stanza=main stanza-create 2>&1 | while IFS= read -r _l; do log "stanza-create: ${_l}"; done
-          write_state_field catalog_verify_inconclusive_since 0
-          write_state_field last_catalog_verify_at "$now"
-          log "clearing last_full_at to re-trigger initial full (was last_full=${last_full})"
-          write_state_field last_full_at ""
-          DECIDED_ACTION="full"; return 0
-        fi
-        log "catalog check inconclusive (S3 unreachable or backup.info not readable); skipping (inconclusive ${incon_for}s, archived_grew=${archived_grew})"
-      fi
-    else
-      write_state_field last_catalog_verify_at "$now"
-      write_state_field catalog_verify_inconclusive_since 0
+    elif [ "$_crc" -eq 1 ]; then
       log "catalog shows no full backup despite local state (last_full=${last_full}); clearing last_full_at to trigger new full"
       write_state_field last_full_at ""
-      DECIDED_ACTION="full"; return 0
+      if [ "$full_attempt_ok" -eq 1 ]; then DECIDED_ACTION="full"; return 0; fi
+      DECIDED_ACTION=""; return 0
+    else
+      log "catalog check inconclusive (pgbackrest info errored); logging probe error + running idempotent stanza-create"
+      log_catalog_probe_error
+      pgbackrest --stanza=main stanza-create 2>&1 | while IFS= read -r _l; do log "stanza-create: ${_l}"; done
     fi
   fi
 
   # Periodic full. FULL_INTERVAL_SECONDS=0 disables the periodic full while
   # still allowing NEEDS_INITIAL_BACKUP (above) and gap-recovery to fire.
   if [ "$FULL_INTERVAL_SECONDS" -gt 0 ] \
-     && [ "$now" -ge $((last_full + FULL_INTERVAL_SECONDS)) ]; then
+     && [ "$now" -ge $((last_full + FULL_INTERVAL_SECONDS)) ] \
+     && [ "$full_attempt_ok" -eq 1 ]; then
     DECIDED_ACTION="full"; return 0
   fi
 

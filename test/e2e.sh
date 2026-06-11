@@ -3384,27 +3384,25 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
-# M2. Catalog-verify deadlock self-heal. When `pgbackrest info` errors
-# (rc=2) persistently — e.g. backup.info rejected after an interrupted
-# first full — while last_full_at is set in state, the verify path used
-# to log "inconclusive ... skipping" forever and never re-take the full:
-# WAL kept archiving but fullCount stayed 0 (only LOG_SPEW surfaced).
-# This test corrupts backup.info in S3 (info → non-zero) while keeping
-# archive-push working (archive.info intact, ARCHIVED_COUNT climbs), and
-# asserts the watcher detects the broken catalog (not an S3 outage),
-# logs the real probe error, runs stanza-create, and clears last_full_at
-# to re-trigger the initial full.
+# M2. Catalog-verify self-heal (rc=1 path). A volume can survive with
+# last_full_at set in local state while S3 has lost the full (catalog
+# wiped / restored from a backup that predates the full / redeploy that
+# dropped the bucket). NEEDS_INITIAL_BACKUP only fires on empty state, so
+# without catalog verification the watcher takes diffs against a phantom
+# full forever. This test reproduces it by keeping the volume but wiping
+# S3, then asserts the periodic verify sees "no full present", clears
+# last_full_at, and a fresh full is taken.
 t_catalog_verify_deadlock_selfheals() {
   local name=t-verify-deadlock-${PG_VERSION}
   local vol=${name}-vol
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  # SELFHEAL_AFTER=10s + VERIFY_INTERVAL=5s so the deadlock breaker trips
-  # within the test window instead of the 30-min prod default.
+  # Fast verify + short full-retry backoff so the self-heal completes inside
+  # the test window rather than the 1h / 10min prod defaults.
   run_archiving_pg_fast_watcher "$name" "$vol" \
     -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
-    -e WAL_BACKUP_CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS=10
+    -e WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS=5
   wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
   for _ in $(seq 1 15); do
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
@@ -3413,39 +3411,42 @@ t_catalog_verify_deadlock_selfheals() {
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$name" full 60 || { ko t_catalog_verify_deadlock_selfheals "no initial full"; fail_dump t_catalog_verify_deadlock_selfheals "$name"; return; }
 
-  # Corrupt backup.info (and its .copy fallback) in S3 so `pgbackrest info`
-  # exits non-zero (rc=2) while archive.info stays valid → archive-push
-  # keeps succeeding. last_full_at is still set from the initial full, so
-  # the bug's preconditions (rc=2 + stale anchor) are reproduced exactly.
-  mc "for f in \$(mc find local/${BUCKET} --name 'backup.info' ; mc find local/${BUCKET} --name 'backup.info.copy'); do echo 'corrupt-by-e2e' | mc pipe \"\$f\"; done" >/dev/null
+  # Reproduce the divergence: keep the volume (local state still says
+  # last_full_at=<initial full>), but wipe S3. On restart bootstrap recreates
+  # an empty stanza; last_full_at is stale so NEEDS_INITIAL won't re-fire —
+  # only the catalog-verify rc=1 path (valid stanza, zero backups) can break
+  # the deadlock. A fresh container also resets docker logs, so the assertions
+  # below only see post-restart output.
+  docker rm -f "$name" >/dev/null
+  reset_bucket
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS=5
+  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "restart"; fail_dump t_catalog_verify_deadlock_selfheals "$name"; return; }
 
-  # Keep WAL flowing across the inconclusive window so ARCHIVED_COUNT grows
-  # (proves S3 is reachable → the breaker classifies the catalog as broken,
-  # not S3 down). 30s covers the 5s verify interval + 10s self-heal dwell.
-  for _ in $(seq 1 15); do
-    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
-    sleep 2
-  done
+  # Keep WAL moving so the post-clear full has a closing segment to archive.
+  ( for _ in $(seq 1 30); do
+      docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
+      sleep 2
+    done ) &
+  local wal_pid=$!
 
-  local logs; logs=$(docker logs "$name" 2>&1)
-  if ! printf '%s' "$logs" | grep -q "backup.info is broken, not S3 down; self-healing"; then
-    ko t_catalog_verify_deadlock_selfheals "watcher never tripped the deadlock breaker"
+  # Expect: verify sees no full → clears last_full_at → NEEDS_INITIAL → full.
+  if ! wait_for_watcher_backup "$name" full 90; then
+    kill "$wal_pid" 2>/dev/null || true
+    ko t_catalog_verify_deadlock_selfheals "no fresh full after S3 lost the catalog"
     fail_dump t_catalog_verify_deadlock_selfheals "$name"
     return
   fi
-  if ! printf '%s' "$logs" | grep -q "catalog probe diagnostic: pgbackrest info exited rc="; then
-    ko t_catalog_verify_deadlock_selfheals "self-heal did not surface the swallowed probe stderr"
-    fail_dump t_catalog_verify_deadlock_selfheals "$name"
-    return
-  fi
-  if ! printf '%s' "$logs" | grep -q "clearing last_full_at to re-trigger initial full"; then
-    ko t_catalog_verify_deadlock_selfheals "self-heal did not clear last_full_at"
+  kill "$wal_pid" 2>/dev/null || true
+  if ! docker logs "$name" 2>&1 | grep -q "clearing last_full_at to trigger new full"; then
+    ko t_catalog_verify_deadlock_selfheals "fresh full taken but not via the catalog-verify rc=1 clear path"
     fail_dump t_catalog_verify_deadlock_selfheals "$name"
     return
   fi
 
   ok t_catalog_verify_deadlock_selfheals
-  note "rc=2 catalog while archiving advanced → breaker logged probe stderr, ran stanza-create, cleared last_full_at"
+  note "volume kept stale last_full_at + S3 wiped → catalog-verify rc=1 cleared last_full_at → fresh full taken"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
