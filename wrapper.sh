@@ -91,6 +91,15 @@ add_pg_stat_statements() {
 # Ensure pg_stat_statements is in shared_preload_libraries for existing databases
 # This handles databases created before this setting was added
 AUTO_CONF_FILE="$PGDATA/postgresql.auto.conf"
+
+# Raise max_connections so PgBouncer (3 replicas × default_pool_size=20 = 60
+# backend connections) doesn't exhaust the PostgreSQL default of 100. Writing
+# to auto.conf overrides postgresql.conf without touching the file Postgres
+# manages itself. Skipped if already set (e.g. via ALTER SYSTEM by the user).
+if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "^[[:space:]]*max_connections" "$AUTO_CONF_FILE" 2>/dev/null; then
+  echo "wrapper: setting max_connections = 500 in postgresql.auto.conf"
+  echo "max_connections = 500" >> "$AUTO_CONF_FILE"
+fi
 if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "pg_stat_statements" "$POSTGRES_CONF_FILE"; then
   echo "Adding pg_stat_statements to shared_preload_libraries..."
   add_pg_stat_statements "$POSTGRES_CONF_FILE"
