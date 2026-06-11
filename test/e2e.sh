@@ -3384,6 +3384,72 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
+# M2. Catalog-verify deadlock self-heal. When `pgbackrest info` errors
+# (rc=2) persistently — e.g. backup.info rejected after an interrupted
+# first full — while last_full_at is set in state, the verify path used
+# to log "inconclusive ... skipping" forever and never re-take the full:
+# WAL kept archiving but fullCount stayed 0 (only LOG_SPEW surfaced).
+# This test corrupts backup.info in S3 (info → non-zero) while keeping
+# archive-push working (archive.info intact, ARCHIVED_COUNT climbs), and
+# asserts the watcher detects the broken catalog (not an S3 outage),
+# logs the real probe error, runs stanza-create, and clears last_full_at
+# to re-trigger the initial full.
+t_catalog_verify_deadlock_selfheals() {
+  local name=t-verify-deadlock-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # SELFHEAL_AFTER=10s + VERIFY_INTERVAL=5s so the deadlock breaker trips
+  # within the test window instead of the 30-min prod default.
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_CATALOG_VERIFY_SELFHEAL_AFTER_SECONDS=10
+  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_catalog_verify_deadlock_selfheals "no initial full"; fail_dump t_catalog_verify_deadlock_selfheals "$name"; return; }
+
+  # Corrupt backup.info (and its .copy fallback) in S3 so `pgbackrest info`
+  # exits non-zero (rc=2) while archive.info stays valid → archive-push
+  # keeps succeeding. last_full_at is still set from the initial full, so
+  # the bug's preconditions (rc=2 + stale anchor) are reproduced exactly.
+  mc "for f in \$(mc find local/${BUCKET} --name 'backup.info' ; mc find local/${BUCKET} --name 'backup.info.copy'); do echo 'corrupt-by-e2e' | mc pipe \"\$f\"; done" >/dev/null
+
+  # Keep WAL flowing across the inconclusive window so ARCHIVED_COUNT grows
+  # (proves S3 is reachable → the breaker classifies the catalog as broken,
+  # not S3 down). 30s covers the 5s verify interval + 10s self-heal dwell.
+  for _ in $(seq 1 15); do
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
+    sleep 2
+  done
+
+  local logs; logs=$(docker logs "$name" 2>&1)
+  if ! printf '%s' "$logs" | grep -q "backup.info is broken, not S3 down; self-healing"; then
+    ko t_catalog_verify_deadlock_selfheals "watcher never tripped the deadlock breaker"
+    fail_dump t_catalog_verify_deadlock_selfheals "$name"
+    return
+  fi
+  if ! printf '%s' "$logs" | grep -q "catalog probe diagnostic: pgbackrest info exited rc="; then
+    ko t_catalog_verify_deadlock_selfheals "self-heal did not surface the swallowed probe stderr"
+    fail_dump t_catalog_verify_deadlock_selfheals "$name"
+    return
+  fi
+  if ! printf '%s' "$logs" | grep -q "clearing last_full_at to re-trigger initial full"; then
+    ko t_catalog_verify_deadlock_selfheals "self-heal did not clear last_full_at"
+    fail_dump t_catalog_verify_deadlock_selfheals "$name"
+    return
+  fi
+
+  ok t_catalog_verify_deadlock_selfheals
+  note "rc=2 catalog while archiving advanced → breaker logged probe stderr, ran stanza-create, cleared last_full_at"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # M1. Gap-recovery in progress must suppress periodic-full AND catalog-
 # verify-driven full. Asserts that with the gap marker present, an
 # overdue catalog-verify cycle (interval=5s) doesn't fire a full backup
@@ -3571,6 +3637,7 @@ ALL_TESTS=(
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
   # audit follow-ups (M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
+  t_catalog_verify_deadlock_selfheals
   t_gap_marker_suppresses_catalog_verify_full
   t_stanza_create_timeout_sentinel_absent_on_success
   t_invalid_bucket_sentinel_cleared_on_disable
