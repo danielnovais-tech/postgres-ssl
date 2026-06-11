@@ -3411,16 +3411,22 @@ t_catalog_verify_deadlock_selfheals() {
   local before_full
   before_full=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: backup --type=full completed" || true)
 
-  # Wipe the catalog while the container keeps running. Using pgbackrest's own
-  # stanza-delete --force + stanza-create is the only reliable approach: mc's
-  # bucket operations miss pgBackRest's leading-slash repo keys (/pgbackrest/
-  # cluster-<sysid>/…) so mc rb --force leaves backup.info intact and
-  # pgbackrest info still returns rc=0 after the wipe. stanza-delete knows the
-  # full key layout and removes everything; stanza-create leaves an empty stanza
-  # so pgbackrest info exits 0 with zero backups → catalog_check_backup rc=1 →
-  # clears last_full_at → triggers the fresh full we're testing for.
-  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-delete --force 2>&1 | tail -2 || true"
-  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-create 2>&1 | tail -2 || true"
+  # Wipe the catalog while the container keeps running. mc bucket operations
+  # miss pgBackRest's leading-slash repo keys (/pgbackrest/cluster-<sysid>/…)
+  # so mc rb --force leaves backup.info intact. Use pgbackrest's own commands
+  # instead — they know the full key layout. Sequence while postgres is running:
+  #   stop        → creates /tmp/pgbackrest/main.stop so stanza-delete can run
+  #   stanza-delete → removes all S3 data for the stanza (no --force: that flag
+  #                   is only for when postgres is DOWN and stop wasn't run)
+  #   stanza-create → recreates an empty stanza (backup.info valid, 0 backups)
+  #   start       → removes the stop file so archiving resumes
+  # After start, the next catalog-verify (interval=5s) sees pgbackrest info exit
+  # 0 with an empty backup list → catalog_check_backup rc=1 → clears last_full_at
+  # → triggers the fresh full we're testing for.
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stop 2>&1 | tail -1 || true"
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-delete 2>&1 | tail -1 || true"
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-create 2>&1 | tail -1 || true"
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main start 2>&1 | tail -1 || true"
 
   # Keep WAL moving so the post-clear full has a closing segment to archive.
   ( for _ in $(seq 1 50); do
