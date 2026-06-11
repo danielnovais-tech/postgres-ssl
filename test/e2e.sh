@@ -3398,28 +3398,29 @@ t_catalog_verify_deadlock_selfheals() {
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
+  # WAL_BACKUP_INITIAL_POLL_SECONDS=20: after the first skipped iteration
+  # (pg_isready fails while postgres is still initializing), the watcher sleeps
+  # 20s before its next attempt. This gives us a reliable window to inject the
+  # deadlock condition after postgres is up without racing the first real
+  # watcher iteration.
   run_archiving_pg_fast_watcher "$name" "$vol" \
-    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_INITIAL_POLL_SECONDS=20
 
-  # Inject the deadlock condition directly into the state file BEFORE the
-  # watcher's first real iteration. The watcher skips while pg_isready fails
-  # (postgres still starting), giving us a reliable window to write the file.
+  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
+
+  # Inject the deadlock condition: last_full_at is set but S3 stanza is empty.
+  # This mimics what happens when a container is killed mid-first-full and a
+  # new one starts on the same volume.
   #
-  # Condition: last_full_at is set (non-empty) but S3 stanza is empty — exactly
-  # what happens when a container is killed mid-first-full and a new one starts
-  # on the same volume. Docker's PG_VERSION check means our extra file doesn't
-  # interfere with initdb.
-  #
-  # Flow once the watcher's first real iteration runs:
+  # Flow on the watcher's next iteration (≤20s away):
   #   1. stanza_create_step → stanza didn't exist → creates it (empty backup.info)
-  #   2. decide_action: last_full_at set → skip NEEDS_INITIAL → run catalog-verify
+  #   2. decide_action: last_full_at set → skip NEEDS_INITIAL → catalog-verify
   #   3. catalog_check_backup: pgbackrest info exits 0, 0 backups → rc=1
   #   4. "clearing last_full_at to trigger new full" → NEEDS_INITIAL fires → full
   local fake_at; fake_at=$(( $(date +%s) - 60 ))
   docker exec "$name" bash -c \
     "printf 'last_full_at=${fake_at}\n' > /var/lib/postgresql/data/.pgbackrest_backup_state"
-
-  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
 
   # Wait for the rc=1 self-heal log line (proves the catalog-verify path fired).
   local deadline=$(($(date +%s) + 60)) got_clear=0
