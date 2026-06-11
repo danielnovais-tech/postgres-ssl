@@ -3411,12 +3411,16 @@ t_catalog_verify_deadlock_selfheals() {
   local before_full
   before_full=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: backup --type=full completed" || true)
 
-  # Wipe the catalog while the container keeps running. `rb --force` removes
-  # every object regardless of the leading-slash repo path (cluster-<sysid>
-  # lives under "/pgbackrest/…", which `rm -r local/<bucket>` can miss);
-  # recreate empty so stanza-create + archive-push can resume. Now: info finds
-  # the stanza gone (rc=2 → stanza-create), then an empty stanza (rc=1).
-  mc "mc rb --force local/${BUCKET} >/dev/null 2>&1; mc mb -p local/${BUCKET} >/dev/null"
+  # Wipe the catalog while the container keeps running. Using pgbackrest's own
+  # stanza-delete --force + stanza-create is the only reliable approach: mc's
+  # bucket operations miss pgBackRest's leading-slash repo keys (/pgbackrest/
+  # cluster-<sysid>/…) so mc rb --force leaves backup.info intact and
+  # pgbackrest info still returns rc=0 after the wipe. stanza-delete knows the
+  # full key layout and removes everything; stanza-create leaves an empty stanza
+  # so pgbackrest info exits 0 with zero backups → catalog_check_backup rc=1 →
+  # clears last_full_at → triggers the fresh full we're testing for.
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-delete --force 2>&1 | tail -2 || true"
+  docker exec "$name" bash -c "gosu postgres pgbackrest --stanza=main stanza-create 2>&1 | tail -2 || true"
 
   # Keep WAL moving so the post-clear full has a closing segment to archive.
   ( for _ in $(seq 1 50); do
