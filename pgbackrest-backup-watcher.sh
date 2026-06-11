@@ -107,13 +107,15 @@ DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 # fresh state). Default: 3600 (1 hour).
 CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
 
-# Minimum spacing between full-backup *attempts* (seconds). NEEDS_INITIAL_BACKUP
-# and the catalog-verify rc=1 self-heal both clear/leave last_full_at empty,
-# which makes decide_action want a full every poll — so a full that keeps
-# FAILING (S3 down, broken backup.info) would hammer S3 with full-sized pushes
-# every ~60s. last_full_attempt_at is stamped at the start of each full, and
-# decide_action suppresses the next full until this much time has passed. The
-# first attempt on a fresh enable is never delayed (no prior attempt recorded).
+# Minimum spacing between retries of a FAILING full backup (seconds).
+# NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 self-heal both leave
+# last_full_at empty, which makes decide_action want a full every poll — so a
+# full that keeps failing (S3 down, broken backup.info) would hammer S3 with
+# full-sized pushes every ~60s. run_backup records last_full_failure_at only on
+# a failed full (and clears it on success); decide_action suppresses the next
+# full until this elapses. A full that follows a *deliberate* last_full_at clear
+# (fresh enable, rc=1 self-heal, WAL_REGRESSION migrate) carries no fresh
+# failure marker, so it fires immediately — only failing retries are throttled.
 FULL_RETRY_BACKOFF_SECONDS="${WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS:-600}"
 
 # LSN-lag detection — see file header. Detection runs every iteration (no
@@ -143,12 +145,13 @@ log() { echo "pgbackrest-watcher: $*"; }
 #   last_diff_at=<epoch>             — last successful diff/incr backup
 #   last_full_failed_count=<int>     — pg_stat_archiver.failed_count after last full
 #   last_catalog_verify_at=<epoch>   — last S3 catalog probe (catalog_check_backup)
-#   last_full_attempt_at=<epoch>     — epoch a full backup was last *attempted*
-#                                      (stamped at the start of run_backup full,
-#                                      success or fail). decide_action spaces
-#                                      successive full attempts at least
-#                                      FULL_RETRY_BACKOFF_SECONDS apart so a
-#                                      failing full doesn't hammer S3 every poll.
+#   last_full_failure_at=<epoch>     — epoch a full backup last FAILED (written
+#                                      in run_backup on a failed full, cleared
+#                                      on success). decide_action throttles
+#                                      retries of a failing full to one per
+#                                      FULL_RETRY_BACKOFF_SECONDS; a full after a
+#                                      deliberate last_full_at clear is never
+#                                      delayed (no fresh failure marker).
 #   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started
 #   catalog_max_at_detection=<wal>   — catalog max segment at detection (recovery
 #                                       proof is "current catalog_max > this")
@@ -254,12 +257,6 @@ is_standby() {
 run_backup() {
   local type="$1"
   log "running pgbackrest backup --type=$type"
-  # Stamp the attempt time up front (success or fail) so decide_action's
-  # FULL_RETRY_BACKOFF_SECONDS spacing applies to a full that keeps failing,
-  # rather than re-firing it every poll.
-  if [ "$type" = "full" ]; then
-    write_state_field last_full_attempt_at "$(date +%s)"
-  fi
   # --repo=1 scopes backup + post-backup expire to this service's own bucket.
   # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
   # would default to writing the new base into both repos.
@@ -277,6 +274,10 @@ run_backup() {
   fi
 
   if [ "$exit_code" -ne 0 ]; then
+    # Record the failure time only for fulls so decide_action can space
+    # repeated initial/periodic full *retries* (FULL_RETRY_BACKOFF_SECONDS)
+    # without hammering S3 every poll. Diffs aren't gated.
+    [ "$type" = "full" ] && write_state_field last_full_failure_at "$(date +%s)"
     log "backup --type=$type failed (will retry on next poll)"
     return 1
   fi
@@ -286,6 +287,10 @@ run_backup() {
     full)
       write_state_field last_full_at "$now"
       write_state_field last_diff_at "$now"
+      # Clear the failure marker so a subsequent deliberate last_full_at clear
+      # (catalog-verify rc=1, WAL_REGRESSION migrate) re-fires the full
+      # immediately rather than inheriting this run's backoff.
+      write_state_field last_full_failure_at ""
       # clear_gap_recovery_state refreshes pg_stat_archiver and writes
       # last_full_failed_count itself — folds failures-during-backup into
       # the anchor so the next iteration doesn't re-fire detection.
@@ -1106,17 +1111,17 @@ decide_action() {
   # loudly instead of producing an unrestorable base — no need to gate on
   # "archive-push has worked once". Earlier the gate cost 60-120s of dead
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
-  # Full-attempt backoff. A full that keeps FAILING (S3 down, broken
-  # backup.info) would otherwise be re-attempted every poll once last_full is
-  # empty — hammering S3 with full-sized pushes. last_full_attempt_at is
-  # stamped at the START of every full in run_backup, so successive *attempts*
-  # are spaced at least FULL_RETRY_BACKOFF_SECONDS apart. The first attempt on
-  # a fresh enable fires immediately (no prior attempt recorded), so a healthy
-  # initial full is never delayed.
-  local last_full_attempt full_attempt_ok=1
-  last_full_attempt=$(read_state last_full_attempt_at)
-  if [ -n "$last_full_attempt" ] \
-     && [ $((now - last_full_attempt)) -lt "$FULL_RETRY_BACKOFF_SECONDS" ]; then
+  # Full-retry backoff. A full that keeps FAILING (S3 down, broken backup.info)
+  # would otherwise be re-attempted every poll while last_full is empty —
+  # hammering S3 with full-sized pushes. run_backup records last_full_failure_at
+  # only when a full FAILS (and clears it on success), so this gates *retries*
+  # of a failing full without ever delaying a full that follows a deliberate
+  # last_full_at clear (fresh enable, catalog-verify rc=1, WAL_REGRESSION
+  # migrate — all of which leave no fresh failure marker).
+  local last_full_failure full_attempt_ok=1
+  last_full_failure=$(read_state last_full_failure_at)
+  if [ -n "$last_full_failure" ] \
+     && [ $((now - last_full_failure)) -lt "$FULL_RETRY_BACKOFF_SECONDS" ]; then
     full_attempt_ok=0
   fi
 

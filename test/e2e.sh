@@ -3384,25 +3384,22 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
-# M2. Catalog-verify self-heal (rc=1 path). A volume can survive with
-# last_full_at set in local state while S3 has lost the full (catalog
-# wiped / restored from a backup that predates the full / redeploy that
-# dropped the bucket). NEEDS_INITIAL_BACKUP only fires on empty state, so
-# without catalog verification the watcher takes diffs against a phantom
-# full forever. This test reproduces it by keeping the volume but wiping
-# S3, then asserts the periodic verify sees "no full present", clears
-# last_full_at, and a fresh full is taken.
+# M2. Catalog-verify self-heal. local state can carry last_full_at while S3
+# has lost the full (catalog wiped, redeploy that dropped the bucket, restore
+# from before the full). NEEDS_INITIAL_BACKUP only fires on empty state, so
+# without catalog verification the watcher rides a phantom full forever. This
+# wipes the catalog out from under the running container (volume keeps
+# last_full_at), then asserts the verify repairs the stanza (rc=2 →
+# stanza-create) and on the next cycle sees "no full present" (rc=1), clears
+# last_full_at, and takes a fresh full.
 t_catalog_verify_deadlock_selfheals() {
   local name=t-verify-deadlock-${PG_VERSION}
   local vol=${name}-vol
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  # Fast verify + short full-retry backoff so the self-heal completes inside
-  # the test window rather than the 1h / 10min prod defaults.
   run_archiving_pg_fast_watcher "$name" "$vol" \
-    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
-    -e WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS=5
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5
   wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
   for _ in $(seq 1 15); do
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
@@ -3411,34 +3408,38 @@ t_catalog_verify_deadlock_selfheals() {
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
   wait_for_watcher_backup "$name" full 60 || { ko t_catalog_verify_deadlock_selfheals "no initial full"; fail_dump t_catalog_verify_deadlock_selfheals "$name"; return; }
 
-  # Reproduce the divergence: keep the volume (local state still says
-  # last_full_at=<initial full>), but wipe S3. On restart bootstrap recreates
-  # an empty stanza; last_full_at is stale so NEEDS_INITIAL won't re-fire —
-  # only the catalog-verify rc=1 path (valid stanza, zero backups) can break
-  # the deadlock. A fresh container also resets docker logs, so the assertions
-  # below only see post-restart output.
-  docker rm -f "$name" >/dev/null
-  reset_bucket
-  run_archiving_pg_fast_watcher "$name" "$vol" \
-    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
-    -e WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS=5
-  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "restart"; fail_dump t_catalog_verify_deadlock_selfheals "$name"; return; }
+  local before_full
+  before_full=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: backup --type=full completed" || true)
+
+  # Wipe the catalog while the container keeps running. `rb --force` removes
+  # every object regardless of the leading-slash repo path (cluster-<sysid>
+  # lives under "/pgbackrest/…", which `rm -r local/<bucket>` can miss);
+  # recreate empty so stanza-create + archive-push can resume. Now: info finds
+  # the stanza gone (rc=2 → stanza-create), then an empty stanza (rc=1).
+  mc "mc rb --force local/${BUCKET} >/dev/null 2>&1; mc mb -p local/${BUCKET} >/dev/null"
 
   # Keep WAL moving so the post-clear full has a closing segment to archive.
-  ( for _ in $(seq 1 30); do
+  ( for _ in $(seq 1 50); do
       docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
       sleep 2
     done ) &
   local wal_pid=$!
 
-  # Expect: verify sees no full → clears last_full_at → NEEDS_INITIAL → full.
-  if ! wait_for_watcher_backup "$name" full 90; then
-    kill "$wal_pid" 2>/dev/null || true
-    ko t_catalog_verify_deadlock_selfheals "no fresh full after S3 lost the catalog"
+  # A NEW full must land after the wipe (count grows past the initial one).
+  local deadline=$(($(date +%s) + 120)) got=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local after_full
+    after_full=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: backup --type=full completed" || true)
+    [ "$after_full" -gt "$before_full" ] && { got=1; break; }
+    sleep 3
+  done
+  kill "$wal_pid" 2>/dev/null || true
+
+  if [ "$got" != 1 ]; then
+    ko t_catalog_verify_deadlock_selfheals "no fresh full after catalog wipe"
     fail_dump t_catalog_verify_deadlock_selfheals "$name"
     return
   fi
-  kill "$wal_pid" 2>/dev/null || true
   if ! docker logs "$name" 2>&1 | grep -q "clearing last_full_at to trigger new full"; then
     ko t_catalog_verify_deadlock_selfheals "fresh full taken but not via the catalog-verify rc=1 clear path"
     fail_dump t_catalog_verify_deadlock_selfheals "$name"
@@ -3446,7 +3447,7 @@ t_catalog_verify_deadlock_selfheals() {
   fi
 
   ok t_catalog_verify_deadlock_selfheals
-  note "volume kept stale last_full_at + S3 wiped → catalog-verify rc=1 cleared last_full_at → fresh full taken"
+  note "catalog wiped under running container → verify rc=2 stanza-create then rc=1 cleared last_full_at → fresh full taken"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
