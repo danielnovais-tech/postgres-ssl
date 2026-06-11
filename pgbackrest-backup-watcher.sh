@@ -204,7 +204,7 @@ LAST_FAILED_WAL=""
 # and corrupt the bind. The sentinel is stripped below.
 refresh_archiver_stats() {
   local stats wal_field failed_wal_field
-  stats=$(psql -U postgres -tAXq -F' ' -c "
+  stats=$(psql -U "${PGUSER:-postgres}" -tAXq -F' ' -c "
     SELECT
       archived_count,
       failed_count,
@@ -232,7 +232,7 @@ refresh_archiver_stats() {
 # stanza lock is the second-line guarantee against double-trigger).
 is_standby() {
   local r
-  r=$(psql -U postgres -tAXq -c "SELECT pg_is_in_recovery()" 2>/dev/null) || return 1
+  r=$(psql -U "${PGUSER:-postgres}" -tAXq -c "SELECT pg_is_in_recovery()" 2>/dev/null) || return 1
   [ "$r" = "t" ]
 }
 
@@ -335,7 +335,7 @@ WAL_SEGMENT_SIZE_BYTES=16777216
 # strictly less bad than not detecting wedges at all.
 refresh_wal_segment_size() {
   local pages
-  pages=$(psql -U postgres -tAXq -c \
+  pages=$(psql -U "${PGUSER:-postgres}" -tAXq -c \
     "SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'" \
     2>/dev/null) || return 1
   [ -z "$pages" ] && return 1
@@ -1148,7 +1148,7 @@ decide_action() {
 # only fails on a postmaster shutdown or a write barrier, in which case the
 # next iteration's backup will retry.
 emit_pitr_anchor() {
-  psql -U postgres -tAXq -c \
+  psql -U "${PGUSER:-postgres}" -tAXq -c \
     "SELECT pg_logical_emit_message(true, 'rwy_pitr_anchor', '')" \
     >/dev/null 2>&1 \
     && log "pitr anchor emitted" \
@@ -1161,13 +1161,13 @@ emit_pitr_anchor() {
 # emit just postpones the next segment switch by one tick.
 emit_wal_heartbeat() {
   [ "${WAL_HEARTBEAT_DISABLED:-0}" = "1" ] && return 0
-  psql -U postgres -tAXq -c \
+  psql -U "${PGUSER:-postgres}" -tAXq -c \
     "SELECT pg_logical_emit_message(false, 'rwy_pitr_heartbeat', '')" \
     >/dev/null 2>&1 || true
 }
 
 watcher_iteration() {
-  if ! pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; then
+  if ! pg_isready -h 127.0.0.1 -p 5432 -U "${PGUSER:-postgres}" -q 2>/dev/null; then
     log "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
     return 0
   fi

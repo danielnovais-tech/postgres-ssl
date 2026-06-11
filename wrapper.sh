@@ -532,6 +532,8 @@ process-max=${restore_max}
 [main]
 pg1-path=${PGDATA}
 pg1-port=5432
+pg1-user=${PGUSER:-postgres}
+pg1-database=${PGDATABASE:-postgres}
 EOF
   chown postgres:postgres "$PGBACKREST_CONF_FILE"
   chmod 0640 "$PGBACKREST_CONF_FILE"
