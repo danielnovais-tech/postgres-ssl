@@ -325,13 +325,15 @@ catalog_check_backup() {
   rc=$?
   [ "$rc" -ne 0 ] && return 2
   [ -z "$info_out" ] && return 2
-  if printf '%s' "$info_out" | jq -e '[.[]?.backup[]? | select(.type == "full")] | length > 0' >/dev/null 2>&1; then
-    return 0
-  fi
-  local jq_rc=$?
-  # jq exit 1 = filter evaluated to false → no full present (conclusive).
-  # Any other rc (2 = parse error, 3+ = other) → treat as inconclusive.
-  [ "$jq_rc" -eq 1 ] && return 1
+  # jq -r outputs "true" or "false"; || handles parse errors (jq rc=2+).
+  # Avoid capturing $? after an if...fi block — bash sets $? to 0 when the
+  # condition is false and there is no else branch, masking jq's rc=1.
+  local has_full
+  has_full=$(printf '%s' "$info_out" \
+    | jq -r '[.[]?.backup[]? | select(.type == "full")] | length > 0' 2>/dev/null) \
+    || return 2
+  [ "$has_full" = "true" ]  && return 0
+  [ "$has_full" = "false" ] && return 1
   return 2
 }
 
