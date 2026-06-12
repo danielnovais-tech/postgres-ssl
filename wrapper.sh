@@ -981,6 +981,50 @@ fork_pgbackrest_backup_watcher() {
   gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
 }
 
+# Wait for postgres to be ready then refresh collation versions on all databases.
+# ALTER DATABASE ... REFRESH COLLATION VERSION was introduced in PG 15; skipped on older versions.
+# Collation version mismatches occur when the container image is rebuilt with a newer glibc but
+# the database volume was initialized with the old version — postgres emits a WARNING on every
+# connection until refreshed, which is harmless but noisy.
+fork_collation_refresh() {
+  (
+    local i=0
+    while ! gosu postgres pg_isready -q 2>/dev/null; do
+      sleep 2
+      i=$((i+1))
+      [ $i -ge 60 ] && exit 0
+    done
+
+    local pg_major
+    pg_major=$(cat "$PGDATA/PG_VERSION" 2>/dev/null || echo "0")
+    [ "$pg_major" -lt 15 ] 2>/dev/null && exit 0
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/collation-refresh.XXXXXX.sql)
+    cat > "$tmpfile" << 'ENDSQL'
+DO $body$
+DECLARE
+  db record;
+BEGIN
+  FOR db IN
+    SELECT datname FROM pg_database
+    WHERE datallowconn AND datname <> 'template0'
+  LOOP
+    BEGIN
+      EXECUTE format('ALTER DATABASE %I REFRESH COLLATION VERSION', db.datname);
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
+  END LOOP;
+END
+$body$;
+ENDSQL
+    gosu postgres psql -v ON_ERROR_STOP=0 -q -f "$tmpfile" 2>&1 | \
+      while IFS= read -r line; do [ -n "$line" ] && echo "collation-refresh: $line"; done
+    rm -f "$tmpfile"
+  ) &
+}
+
 compute_volume_thresholds
 # Inject the computed pg_wal drop threshold into the env that postgres (and
 # its archive_command wrapper) inherits, unless the operator pinned it. The
@@ -1059,6 +1103,7 @@ fi
 
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
+fork_collation_refresh
 
 # H1 (audit): we considered `exec docker-entrypoint.sh` and a
 # trap+wait+forward-SIGTERM pattern to make `docker stop` flush
