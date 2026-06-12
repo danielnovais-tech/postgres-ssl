@@ -3384,6 +3384,69 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
+# M2. Catalog-verify self-heal. local state can carry last_full_at while S3
+# has lost the full (catalog wiped, redeploy that dropped the bucket, restore
+# from before the full). NEEDS_INITIAL_BACKUP only fires on empty state, so
+# without catalog verification the watcher rides a phantom full forever. This
+# wipes the catalog out from under the running container (volume keeps
+# last_full_at), then asserts the verify repairs the stanza (rc=2 →
+# stanza-create) and on the next cycle sees "no full present" (rc=1), clears
+# last_full_at, and takes a fresh full.
+t_catalog_verify_deadlock_selfheals() {
+  local name=t-verify-deadlock-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # WAL_BACKUP_INITIAL_POLL_SECONDS=20: after the first skipped iteration
+  # (pg_isready fails while postgres is still initializing), the watcher sleeps
+  # 20s before its next attempt. This gives us a reliable window to inject the
+  # deadlock condition after postgres is up without racing the first real
+  # watcher iteration.
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_INITIAL_POLL_SECONDS=20
+
+  wait_for_pg "$name" || { ko t_catalog_verify_deadlock_selfheals "startup"; return; }
+
+  # Inject the deadlock condition: last_full_at is set but S3 stanza is empty.
+  # This mimics what happens when a container is killed mid-first-full and a
+  # new one starts on the same volume.
+  #
+  # Flow on the watcher's next iteration (≤20s away):
+  #   1. stanza_create_step → stanza didn't exist → creates it (empty backup.info)
+  #   2. decide_action: last_full_at set → skip NEEDS_INITIAL → catalog-verify
+  #   3. catalog_check_backup: pgbackrest info exits 0, 0 backups → rc=1
+  #   4. "clearing last_full_at to trigger new full" → NEEDS_INITIAL fires → full
+  local fake_at; fake_at=$(( $(date +%s) - 60 ))
+  docker exec "$name" bash -c \
+    "printf 'last_full_at=${fake_at}\n' > /var/lib/postgresql/data/.pgbackrest_backup_state"
+
+  # Wait for the rc=1 self-heal log line (proves the catalog-verify path fired).
+  local deadline=$(($(date +%s) + 60)) got_clear=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker logs "$name" 2>&1 | grep -q "clearing last_full_at to trigger new full" \
+      && { got_clear=1; break; }
+    sleep 2
+  done
+  if [ "$got_clear" != 1 ]; then
+    ko t_catalog_verify_deadlock_selfheals "catalog-verify rc=1 self-heal did not fire"
+    fail_dump t_catalog_verify_deadlock_selfheals "$name"
+    return
+  fi
+
+  wait_for_watcher_backup "$name" full 90 || {
+    ko t_catalog_verify_deadlock_selfheals "no fresh full after rc=1 self-heal"
+    fail_dump t_catalog_verify_deadlock_selfheals "$name"
+    return
+  }
+
+  ok t_catalog_verify_deadlock_selfheals
+  note "stale last_full_at + empty stanza → catalog-verify rc=1 cleared last_full_at → fresh full taken"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # M1. Gap-recovery in progress must suppress periodic-full AND catalog-
 # verify-driven full. Asserts that with the gap marker present, an
 # overdue catalog-verify cycle (interval=5s) doesn't fire a full backup
@@ -3571,6 +3634,7 @@ ALL_TESTS=(
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
   # audit follow-ups (M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
+  t_catalog_verify_deadlock_selfheals
   t_gap_marker_suppresses_catalog_verify_full
   t_stanza_create_timeout_sentinel_absent_on_success
   t_invalid_bucket_sentinel_cleared_on_disable
