@@ -506,6 +506,15 @@ render_pgbackrest_conf() {
     retention_block="repo1-retention-full=${retention_full}"$'\n'"repo1-retention-diff=${retention_diff}"$'\n'
   fi
 
+  # pg1-database is hardcoded to template1 rather than honoring PGDATABASE.
+  # pgBackRest only needs *a* connectable database to reach the postmaster —
+  # backups are physical/cluster-wide and pg_backup_start/stop are cluster-global
+  # — so its connection target must not depend on the customer's
+  # POSTGRES_DB/PGDATABASE existing. When PGDATABASE pointed at a renamed or
+  # dropped app DB, stanza-create and every archive-push failed [103] and WAL
+  # piled up in pg_wal. template1 is the one database that always exists and
+  # can't be dropped, so the connection can never break. pg1-user still honors
+  # PGUSER.
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
@@ -542,7 +551,7 @@ process-max=${restore_max}
 pg1-path=${PGDATA}
 pg1-port=5432
 pg1-user=${PGUSER:-postgres}
-pg1-database=${PGDATABASE:-postgres}
+pg1-database=template1
 EOF
   chown postgres:postgres "$PGBACKREST_CONF_FILE"
   chmod 0640 "$PGBACKREST_CONF_FILE"
