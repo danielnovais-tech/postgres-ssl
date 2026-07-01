@@ -166,19 +166,22 @@ fi
 # pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
 # async mode: archive_command writes WAL into the local spool dir and
 # returns in milliseconds; a background worker pushes from there to S3.
-# Two orthogonal thresholds gate the "WAL is accumulating, do something":
+# Two thresholds gate the "WAL is accumulating, do something", now sized
+# symmetrically (see compute_volume_thresholds):
 #   - archive-push-queue-max (set in /etc/pgbackrest/pgbackrest.conf) governs
-#     the SPOOL. Trips on transient S3 stalls; pgBackRest drops segments
-#     from spool and reports success to archive_command. Generous buffer
-#     to absorb multi-hour outages cleanly. Default 5 GiB on volumes ≥10 GiB;
-#     scales down to ~50% of volume below that (see compute_volume_thresholds).
+#     the SPOOL. pgBackRest drops segments from spool and reports success to
+#     archive_command once this is exceeded.
 #   - pgbackrest-archive-push-wrapper.sh's WAL_DROP_THRESHOLD_MB governs
-#     pg_wal/. Trips on HARD failures (bad creds, deleted bucket, expired
-#     keys) where pgbackrest's foreground returns non-zero and retrying
-#     without operator intervention has zero chance of success. Smaller
-#     cap because we shouldn't hold 5 GiB of pg_wal hostage waiting for a
-#     config fix. Default 500 MiB on volumes ≥5 GiB; scales down to ~10%
-#     of volume below that, floor 64 MiB.
+#     pg_wal/. Trips when pgbackrest's foreground returns non-zero and
+#     pg_wal has grown past this size.
+# Both default to 5 GiB on volumes ≥10 GiB, scaling down to ~50% of volume
+# below that, floor 128 MiB — a transient S3 stall (500s, timeouts,
+# connection resets — the async worker keeps retrying and most segments
+# eventually get pushed) gets the full budget before either threshold trips,
+# instead of the wrapper's old 10x-smaller pg_wal cap giving up first. Only
+# the two explicit no-recovery-possible errors (NoSuchBucket,
+# InvalidAccessKeyId — see pgbackrest-archive-push-wrapper.sh) bypass both
+# budgets and drop immediately, since no amount of waiting helps those.
 # Either way, PITR window truncates; DB stays up.
 # -----------------------------------------------------------------------------
 
@@ -398,39 +401,38 @@ detect_volume_total_kib() {
 
 # Compute volume-proportional WAL/spool thresholds and write them to globals
 # COMPUTED_WAL_DROP_MB + COMPUTED_QUEUE_MAX_MIB. Both scale DOWN from the
-# absolute defaults (500 MiB pg_wal drop / 5 GiB spool queue-max) on smaller
-# volumes — never up. Hobby's 1 GiB volume can't carry 5 GiB of spool, and
-# 500 MiB of pg_wal is half the disk; on a 25+ GiB volume the absolutes hold.
+# absolute default (5 GiB) on smaller volumes — never up. On a 25+ GiB volume
+# the absolute holds.
 #
-# Ratios: wal-drop ~ 10% of volume (hard-failure pg_wal hostage), queue-max
-# ~ 50% of volume (transient-stall spool absorption). The 10× spread between
-# the two budgets is preserved across all volume sizes — hard failures still
-# bail fast, transient stalls still absorb generously.
+# wal-drop == queue-max, deliberately symmetric (was 10% of volume / 500 MiB
+# cap, a 10x-smaller budget than queue-max — see 2026-07-01 Tigris "sjc"
+# incident: transient S3 500s/connection-resets are exactly the failure
+# pgBackRest's spool is designed to absorb generously, but the wrapper's own
+# 500 MiB pg_wal check tripped first, silently dropping WAL far short of the
+# 5 GiB spool budget that should have covered the whole outage). Only the two
+# explicit no-recovery-possible errors (NoSuchBucket, InvalidAccessKeyId,
+# checked below) bypass this and drop immediately — everything else, hard
+# failure or transient, gets the full budget before we give up on it.
 #
-# Floor: 64 MiB on wal-drop (~4 WAL segments — enough for one short stall),
-# 128 MiB on queue-max (~8 segments). Below these, archiving is effectively
+# Floor: 128 MiB (~8 WAL segments). Below this, archiving is effectively
 # disabled and the dashboard surfaces it.
 compute_volume_thresholds() {
-  local total_kib total_mib wal_drop queue_max cap_queue
+  local total_kib total_mib queue_max cap_queue
   total_kib=$(detect_volume_total_kib)
   if [ "$total_kib" -lt 1 ]; then
-    COMPUTED_WAL_DROP_MB=500
+    COMPUTED_WAL_DROP_MB=5120
     COMPUTED_QUEUE_MAX_MIB=5120
-    echo "pgbackrest: volume size unknown; using absolute thresholds wal-drop=500 MiB queue-max=5 GiB"
+    echo "pgbackrest: volume size unknown; using absolute threshold wal-drop=queue-max=5 GiB"
     return
   fi
   total_mib=$(( total_kib / 1024 ))
-
-  wal_drop=$(( total_mib / 10 ))
-  [ "$wal_drop" -gt 500 ] && wal_drop=500
-  [ "$wal_drop" -lt 64 ] && wal_drop=64
-  COMPUTED_WAL_DROP_MB=$wal_drop
 
   cap_queue=$(( 5 * 1024 ))
   queue_max=$(( total_mib / 2 ))
   [ "$queue_max" -gt "$cap_queue" ] && queue_max=$cap_queue
   [ "$queue_max" -lt 128 ] && queue_max=128
   COMPUTED_QUEUE_MAX_MIB=$queue_max
+  COMPUTED_WAL_DROP_MB=$queue_max
 
   echo "pgbackrest: volume ${total_mib} MiB; sized wal-drop=${wal_drop} MiB queue-max=${queue_max} MiB"
 }
