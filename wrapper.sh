@@ -166,22 +166,28 @@ fi
 # pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
 # async mode: archive_command writes WAL into the local spool dir and
 # returns in milliseconds; a background worker pushes from there to S3.
-# Two thresholds gate the "WAL is accumulating, do something", now sized
-# symmetrically (see compute_volume_thresholds):
+# Two thresholds gate the "WAL is accumulating, do something", sized
+# identically (see compute_volume_thresholds) AND checked as ONE shared
+# budget, not two independent ones:
 #   - archive-push-queue-max (set in /etc/pgbackrest/pgbackrest.conf) governs
 #     the SPOOL. pgBackRest drops segments from spool and reports success to
 #     archive_command once this is exceeded.
 #   - pgbackrest-archive-push-wrapper.sh's WAL_DROP_THRESHOLD_MB governs
-#     pg_wal/. Trips when pgbackrest's foreground returns non-zero and
-#     pg_wal has grown past this size.
-# Both default to 5 GiB on volumes ≥10 GiB, scaling down to ~50% of volume
-# below that, floor 128 MiB — a transient S3 stall (500s, timeouts,
-# connection resets — the async worker keeps retrying and most segments
-# eventually get pushed) gets the full budget before either threshold trips,
-# instead of the wrapper's old 10x-smaller pg_wal cap giving up first. Only
-# the two explicit no-recovery-possible errors (NoSuchBucket,
-# InvalidAccessKeyId — see pgbackrest-archive-push-wrapper.sh) bypass both
-# budgets and drop immediately, since no amount of waiting helps those.
+#     pg_wal/ + spool COMBINED. Trips when pgbackrest's foreground returns
+#     non-zero and pg_wal-plus-spool has grown past this size.
+# Both size to 5 GiB on volumes ≥10 GiB, scaling down to ~50% of volume below
+# that, floor 128 MiB — a transient S3 stall (500s, timeouts, connection
+# resets — the async worker keeps retrying and most segments eventually get
+# pushed) gets the full budget before either threshold trips, instead of the
+# wrapper's old 10x-smaller pg_wal-only cap giving up first. Checking the
+# wrapper's threshold against the SUM (not pg_wal alone) matters because
+# pg_wal and the spool can both be filling for different reasons at once
+# (foreground copy-to-spool failing vs. background upload stalled) — without
+# summing, the two caps could each independently reach 5 GiB, letting a
+# single outage hold up to ~2x the intended budget on disk. Only the two
+# explicit no-recovery-possible errors (NoSuchBucket, InvalidAccessKeyId —
+# see pgbackrest-archive-push-wrapper.sh) bypass this and drop immediately,
+# since no amount of waiting helps those.
 # Either way, PITR window truncates; DB stays up.
 # -----------------------------------------------------------------------------
 
@@ -404,7 +410,7 @@ detect_volume_total_kib() {
 # absolute default (5 GiB) on smaller volumes — never up. On a 25+ GiB volume
 # the absolute holds.
 #
-# wal-drop == queue-max, deliberately symmetric (was 10% of volume / 500 MiB
+# wal-drop == queue-max, deliberately identical (was 10% of volume / 500 MiB
 # cap, a 10x-smaller budget than queue-max — see 2026-07-01 Tigris "sjc"
 # incident: transient S3 500s/connection-resets are exactly the failure
 # pgBackRest's spool is designed to absorb generously, but the wrapper's own
@@ -413,6 +419,11 @@ detect_volume_total_kib() {
 # explicit no-recovery-possible errors (NoSuchBucket, InvalidAccessKeyId,
 # checked below) bypass this and drop immediately — everything else, hard
 # failure or transient, gets the full budget before we give up on it.
+#
+# The wrapper checks pg_wal + spool against this value as ONE combined sum
+# (see pgbackrest-archive-push-wrapper.sh), not pg_wal alone — identical caps
+# on two independently-checked directories would let a single outage hold
+# up to ~2x this budget on disk.
 #
 # Floor: 128 MiB (~8 WAL segments). Below this, archiving is effectively
 # disabled and the dashboard surfaces it.
