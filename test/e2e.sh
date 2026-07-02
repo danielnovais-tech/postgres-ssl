@@ -309,7 +309,7 @@ t_invalid_bucket_skips_archive() {
   # (unresolved Railway template ref + bucket-id UUID). The image guard must
   # refuse to enable archiving rather than writing the junk into
   # pgbackrest.conf and letting pgbackrest hard-fail every archive_command
-  # until pgbackrest-archive-push-wrapper.sh's 500 MiB threshold drops WAL.
+  # until pgbackrest-archive-push-wrapper.sh's WAL_DROP_THRESHOLD_MB drops WAL.
   for bad in '${{121ccc45-0912-457e-8dc0-76625fe644bb.BUCKET}}' '121ccc45-0912-457e-8dc0-76625fe644bb'; do
     local name=t-badbucket-${PG_VERSION}
     local vol=${name}-vol
