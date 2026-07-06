@@ -754,18 +754,20 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
-  # /etc/pgbackrest is rebuilt on every boot, so the S3-creds recovery conf
-  # must be re-rendered on every boot while recovery could still be in
-  # progress — postgres' restore_command (persisted in postgresql.auto.conf,
-  # whether written by this wrapper's own pgbackrest restore or an external
-  # one) references this path by name and needs it to exist to keep
-  # fetching WAL. $PGBACKREST_RESTORED_MARKER alone does NOT mean recovery
-  # finished — it means the empty-volume restore ran once, which can be
-  # true while still replaying (e.g. it crashed mid-replay and got
-  # redeployed). Only skip re-rendering once genuinely done: marker (or
-  # $PITR_DONE_MARKER) present AND recovery.signal gone, i.e. postgres has
-  # actually consumed it and promoted — that's also when we stop, to avoid
-  # leaking source-bucket creds onto disk for a long-running promoted
+  # /etc/pgbackrest lives on the container's root filesystem, not the
+  # mounted volume, so it's gone on a genuine redeploy (a brand-new
+  # container) even though it'd survive a plain in-place restart of the
+  # same container. A crashed-mid-replay restore that gets redeployed (e.g.
+  # after a manual resize) hits exactly that case: $PGBACKREST_RESTORED_MARKER
+  # is already set on the (persistent) volume from the first boot's
+  # successful `pgbackrest restore`, but that marker means "the restore
+  # command ran once," not "recovery finished" — postgres hasn't consumed
+  # recovery.signal yet, so it still needs this conf's restore_command to
+  # keep fetching WAL, and the redeploy just wiped it. Re-render on every
+  # boot while that's still possibly true, and only skip once genuinely
+  # done: marker (or $PITR_DONE_MARKER) present AND recovery.signal gone,
+  # i.e. postgres has actually promoted — that's also when we stop, to
+  # avoid leaking source-bucket creds onto disk for a long-running promoted
   # service with no functional benefit.
   local recovery_genuinely_done=0
   if [ -f "$PITR_DONE_MARKER" ]; then
