@@ -1637,21 +1637,36 @@ t_retention_expires_old_fulls() {
 # Run a manual `pgbackrest backup --type=<type>` inside the container, with
 # all REPO1_S3_* env vars exported from the WAL_ARCHIVE_* set the wrapper
 # already populated. Triggers `pgbackrest expire` automatically post-backup.
+#
+# Retries on failure: this races the background pgbackrest-backup-watcher,
+# which holds the same stanza lock while it runs its own periodic backup
+# (see pgbackrest-backup-watcher.sh's "pgBackRest's stanza locks prevent
+# double-trigger" note) — tests using the fast watcher interval can land a
+# manual call while the watcher's own backup has the lock, which pgbackrest
+# rejects outright rather than queuing. That's expected, harmless
+# contention, not a real failure, so retry instead of failing the test.
 take_pgbackrest_backup() {
   local container="$1" backup_type="${2:-full}"
-  docker exec -u postgres "$container" bash -c "
-    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
-    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
-    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
-    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
-    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
-    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
-      export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)\"
-    else
-      export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if docker exec -u postgres "$container" bash -c "
+      export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+      export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+      export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+      export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+      export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+      if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+        export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)\"
+      else
+        export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+      fi
+      pgbackrest --stanza=main backup --type=$backup_type
+    " >/dev/null 2>&1; then
+      return 0
     fi
-    pgbackrest --stanza=main backup --type=$backup_type
-  " >/dev/null 2>&1
+    sleep 2
+  done
+  return 1
 }
 
 # Count zst-compressed WAL segments under any cluster sub-path's archive/main/
