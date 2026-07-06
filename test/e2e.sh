@@ -2877,10 +2877,20 @@ t_recovery_conf_persists_across_restart_mid_replay() {
   local target
   target=$(docker exec "$src_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
   sleep 4
-  docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO bigdata (payload) VALUES ('post-target');" >/dev/null
 
+  # Capture the segment BEFORE switching — pg_current_wal_lsn() points at
+  # the post-target commit's LSN, and pg_walfile_name resolves that LSN to
+  # the segment presently holding it. Recovery only stops-and-promotes on a
+  # record timestamped strictly after target (a commit, not a bare segment
+  # switch); without a post-target commit there's nothing to satisfy that,
+  # and replay runs out of WAL and FATALs with "recovery ended before
+  # configured recovery target was reached" instead of promoting — same
+  # pattern every other target-time restore test in this file relies on
+  # (see id2_segment / id11_segment above).
   local last_segment
   last_segment=$(docker exec "$src_name" psql -U postgres -At -c "SELECT pg_walfile_name(pg_current_wal_lsn())")
+  docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal(); SELECT pg_switch_wal();" >/dev/null
   local archive_deadline=$(($(date +%s) + 90)) shipped=0
   while [ "$(date +%s)" -lt "$archive_deadline" ]; do
     local last_archived_wal
