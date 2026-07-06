@@ -87,7 +87,8 @@ bucket. Two modes:
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
 real push; on failure it measures `pg_wal/`, and when it exceeds the
-threshold (default 500 MiB, override via `WAL_DROP_THRESHOLD_MB`) it
+threshold (sized to half the data volume, capped at 5 GiB, floor 128 MiB —
+override via `WAL_DROP_THRESHOLD_MB`) it
 returns success to Postgres anyway, dropping the segment. This is the
 never-halt safety net for failure modes that bypass pgBackRest's own
 queue-max — bad credentials, deleted bucket, expired keys,
@@ -98,16 +99,22 @@ segment to the next post-recovery base snapshot; below the threshold the
 wrapper surfaces failures normally so transient errors retry on the next
 `archive_timeout`.
 
-The two thresholds gate orthogonal failure regimes:
-- `archive-push-queue-max=5GiB` (image-baked) governs the **spool**.
-  Trips on transient S3 stalls — async worker keeps retrying and most
-  segments eventually land. Generous buffer to absorb multi-hour outages
-  cleanly.
-- `WAL_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`** when
-  pgbackrest's foreground returns non-zero. Trips on hard failures (bad
-  creds, deleted bucket) where retrying without operator intervention has
-  zero chance of success. Smaller cap so we don't hold 5 GiB of pg_wal
-  hostage waiting for a config fix.
+The two thresholds are deliberately sized identically (both
+`min(volume/2, 5GiB)`, floor 128 MiB — see `compute_volume_thresholds`):
+- `archive-push-queue-max` (image-computed) governs the **spool**. Trips
+  when the async worker can't drain it — most segments eventually land
+  once the outage clears.
+- `WAL_DROP_THRESHOLD_MB` (image-computed) governs **`pg_wal/`** when
+  pgbackrest's foreground returns non-zero. Until 2026-07-02 this was a
+  fixed 500 MiB cap — 10x smaller than queue-max. A 2026-07-01 Tigris
+  `sjc` outage showed why that was wrong: transient S3 errors (500s,
+  timeouts, connection resets) are exactly the failure queue-max's 5 GiB
+  buffer is sized to absorb, but the smaller pg_wal check tripped first
+  and silently dropped WAL well short of that budget (#104). Only two
+  explicit no-recovery-possible errors (`NoSuchBucket`,
+  `InvalidAccessKeyId`) still bypass the threshold and drop immediately —
+  every other failure, hard or transient, gets the full computed budget
+  before we give up on it.
 
 Operator-facing env contract:
 
@@ -130,7 +137,7 @@ Image-level tuning knobs (pgBackRest-native, internal):
 
 | Env var | Purpose |
 |---|---|
-| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`). Outside the `PGBACKREST_*` namespace on purpose — pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
+| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default computed as half the data volume, capped at 5 GiB, floor 128 MiB — same formula as `PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX`; falls back to a flat 5 GiB if volume size can't be detected). Outside the `PGBACKREST_*` namespace on purpose — pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)` (≤25% of CPUs to leave room for live DB). |
@@ -256,11 +263,17 @@ follow-up. After a Patroni failover, the new leader's watcher takes
 over; if its local state is stale, an extra full may run, which is
 harmless.
 
-**Known gap**: pgBackRest's `archive-push-queue-max` trip drops segments
-without going through the archive-push wrapper *and* without
-incrementing `failed_count`, so neither gap signal fires. Until log
-parsing or LSN-lag detection lands, queue-max-trip gaps are sealed by
-the next periodic full rather than promptly.
+**Queue-max-trip detection**: pgBackRest's `archive-push-queue-max` trip
+drops segments without going through the archive-push wrapper *and*
+without incrementing `failed_count`, so neither of those two gap signals
+fires on its own. The backup watcher closes this independently: every
+poll (`WAL_BACKUP_POLL_INTERVAL_SECONDS`, default 60s) it compares
+`pg_stat_archiver.last_archived_wal` against the repo's archived
+high-water mark (`pgbackrest info --output=json`); once the lag reaches
+`WAL_LAG_GAP_THRESHOLD_SEGMENTS` (default 32 ≈ 512 MiB) it enters the
+gap-recovery state machine the same way the other two signals do, so a
+fresh full fires once grace elapses instead of waiting for the next
+periodic full (#85, hardened by #86).
 
 `pgbackrest backup` is invoked with `--type=full` or `--type=diff`
 depending on the trigger; the `process-max=backup` setting (default
