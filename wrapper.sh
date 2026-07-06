@@ -754,23 +754,29 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
-  # Recovery already done on this volume: skip both the conf write AND the
-  # staging path. Post-promote services have $PGBACKREST_RESTORED_MARKER
-  # (empty-volume restore handed off its own recovery params) or
-  # $PITR_DONE_MARKER (post-promote, picker-routed cleanup already ran).
-  # Rewriting the source-bucket creds on every boot of a long-promoted
-  # service leaks them onto disk for no functional benefit — archive_command
-  # uses the default conf, not this one, post-promote.
-  if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ]; then
-    return 0
+  # /etc/pgbackrest is rebuilt on every boot, so the S3-creds recovery conf
+  # must be re-rendered on every boot while recovery could still be in
+  # progress — postgres' restore_command (persisted in postgresql.auto.conf,
+  # whether written by this wrapper's own pgbackrest restore or an external
+  # one) references this path by name and needs it to exist to keep
+  # fetching WAL. $PGBACKREST_RESTORED_MARKER alone does NOT mean recovery
+  # finished — it means the empty-volume restore ran once, which can be
+  # true while still replaying (e.g. it crashed mid-replay and got
+  # redeployed). Only skip re-rendering once genuinely done: marker (or
+  # $PITR_DONE_MARKER) present AND recovery.signal gone, i.e. postgres has
+  # actually consumed it and promoted — that's also when we stop, to avoid
+  # leaking source-bucket creds onto disk for a long-running promoted
+  # service with no functional benefit.
+  local recovery_genuinely_done=0
+  if [ -f "$PITR_DONE_MARKER" ]; then
+    recovery_genuinely_done=1
+  elif [ -f "$PGBACKREST_RESTORED_MARKER" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
+    recovery_genuinely_done=1
   fi
 
-  # /etc/pgbackrest is rebuilt on every boot, so always re-render the
-  # recovery conf when WAL_RECOVER_FROM_* is set — postgres' restore_command
-  # references it whether the auto.conf was written by the wrapper's own
-  # pgbackrest restore or by an external one (e.g. test pgbackrest_restore_into).
-  install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
-  cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
+  if [ "$recovery_genuinely_done" -eq 0 ]; then
+    install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
+    cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
 [global]
 log-level-console=info
 log-level-file=off
@@ -788,8 +794,19 @@ repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
 pg1-path=${PGDATA}
 pg1-port=5432
 EOF
-  chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
-  chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+    chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
+    chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+  fi
+
+  # Recovery already done on this volume, OR the conf.d write below would
+  # duplicate what pgbackrest restore already wrote directly into
+  # postgresql.auto.conf: skip the conf.d write AND the staging path.
+  # Unchanged from before — this gate is about the empty-volume-restore
+  # case having already written its own restore_command directly, not about
+  # whether recovery has actually finished (that's handled above).
+  if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ]; then
+    return 0
+  fi
 
   # PGBACKREST_RESTORED_MARKER / PITR_DONE_MARKER short-circuited above, so
   # the only paths reaching here are (a) first-time staging or (b) the

@@ -2813,6 +2813,192 @@ t_restored_marker_persists_across_restarts() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
+# E6. Restarting WHILE still mid-replay (recovery.signal still present) must
+# re-render pgbackrest-recovery-source.conf, even though .pgbackrest_restored
+# is already set from the first boot's successful `pgbackrest restore` call.
+# Production regression: a restore that crashed before promoting (e.g. ran
+# out of disk) and got redeployed (fresh container, same volume) came back
+# with pgbackrest-recovery-source.conf missing — configure_pgbackrest_recovery
+# bailed on the marker alone, without checking whether recovery had actually
+# finished. Postgres could then only replay local WAL and FATALed with
+# "recovery ended before configured recovery target was reached", unable to
+# reach the archive at all. This must NOT regress: the marker alone is not
+# sufficient to skip re-rendering; recovery.signal must also be gone.
+#
+# Doesn't reuse setup_pitr_source: that source's backup-to-target gap is a
+# handful of INSERTs, which promotes in well under a second — nowhere near
+# enough of a replay window to reliably catch mid-flight. This test builds
+# its own source with a bulk insert between the base backup and the target
+# so recovery has real, measurable replay work, then force-kills the
+# restore as soon as it accepts connections (wait_for_pg returns true
+# during recovery, before promote) rather than racing a fixed sleep.
+t_recovery_conf_persists_across_restart_mid_replay() {
+  local src_name=t-src-heavy-${PG_VERSION}
+  local src_vol=${src_name}-vol
+  reset_bucket
+  new_volume "$src_vol"
+  docker rm -f "$src_name" >/dev/null 2>&1 || true
+  run_archiving_pg "$src_name" "$src_vol" -e "WAL_HEARTBEAT_DISABLED=1"
+  wait_for_pg "$src_name" || { ko t_recovery_conf_persists_across_restart_mid_replay "source did not start"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  wait_for_watcher_backup "$src_name" full 60 || {
+    ko t_recovery_conf_persists_across_restart_mid_replay "watcher initial full did not land within 60s"
+    docker rm -f "$src_name" >/dev/null; docker volume rm "$src_vol" >/dev/null
+    return
+  }
+
+  docker exec -u postgres "$src_name" bash -c '
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+    else
+      export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+    fi
+    export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+    export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+    export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+    export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
+    export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+    pgbackrest --stanza=main backup --type=full
+  ' >/dev/null 2>&1
+  local src_path
+  src_path=$(docker exec "$src_name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null || echo "/pgbackrest")
+
+  # Bulk insert between the base backup and the target — gives the restore
+  # real WAL to replay instead of a handful of rows, so recovery takes long
+  # enough (seconds, not milliseconds) to reliably catch it mid-flight.
+  docker exec "$src_name" psql -U postgres -c "
+    CREATE TABLE bigdata (id serial, payload text);
+    INSERT INTO bigdata (payload) SELECT repeat('x', 500) FROM generate_series(1, 400000);
+  " >/dev/null
+  docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  local target
+  target=$(docker exec "$src_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
+  sleep 4
+  docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+
+  local last_segment
+  last_segment=$(docker exec "$src_name" psql -U postgres -At -c "SELECT pg_walfile_name(pg_current_wal_lsn())")
+  local archive_deadline=$(($(date +%s) + 90)) shipped=0
+  while [ "$(date +%s)" -lt "$archive_deadline" ]; do
+    local last_archived_wal
+    last_archived_wal=$(docker exec "$src_name" psql -U postgres -At -c "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null || echo "")
+    if [ -n "$last_archived_wal" ] && { [ "$last_archived_wal" = "$last_segment" ] || [ "$last_archived_wal" \> "$last_segment" ]; }; then
+      shipped=1; break
+    fi
+    docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
+    sleep 2
+  done
+  if [ "$shipped" != 1 ]; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "bulk-insert segment did not ship within 90s"
+    docker rm -f "$src_name" >/dev/null; docker volume rm "$src_vol" >/dev/null
+    return
+  fi
+
+  local rest_name=t-midreplay-restart-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+
+  local restore_env=(
+    -e POSTGRES_PASSWORD=test
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET"
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000"
+    -e WAL_RECOVER_FROM_REGION=us-east-1
+    -e "WAL_RECOVER_FROM_KEY=$MINIO_USER"
+    -e "WAL_RECOVER_FROM_SECRET=$MINIO_PASS"
+    -e "WAL_RECOVER_FROM_PATH=$src_path"
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target"
+  )
+
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  # Tight-poll pg_isready and kill the instant it succeeds — wait_for_pg
+  # returns true during recovery, before promote, so this catches the
+  # restore genuinely mid-replay instead of racing a fixed sleep against
+  # an unknown promote time.
+  local caught=0 i
+  for i in $(seq 1 600); do
+    if docker exec "$rest_name" pg_isready -U postgres -q 2>/dev/null; then
+      caught=1
+      break
+    fi
+    local status
+    status=$(docker inspect -f '{{.State.Status}}' "$rest_name" 2>/dev/null || echo "")
+    if [ "$status" = "exited" ]; then
+      ko t_recovery_conf_persists_across_restart_mid_replay "1st boot exited before becoming ready"
+      fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
+      docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+      return
+    fi
+    sleep 0.2
+  done
+  if [ "$caught" -ne 1 ]; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "1st boot never became ready"
+    fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/recovery.signal; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "test setup: promoted too fast to catch mid-replay (recovery.signal already gone)"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "1st boot didn't write .pgbackrest_restored"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+
+  # Simulate a crash + resize + redeploy: forcibly remove the container
+  # (same volume, same env) and boot a fresh one — /etc/pgbackrest is on
+  # the container's root filesystem, so this wipes the recovery conf that
+  # was in place, exactly like a real redeploy would.
+  docker kill "$rest_name" >/dev/null 2>&1 || true
+  docker rm -f "$rest_name" >/dev/null
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_recovery_conf_persists_across_restart_mid_replay "2nd boot"; fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"; docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null; return; }
+
+  if ! docker exec "$rest_name" test -f /etc/pgbackrest/pgbackrest-recovery-source.conf; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "pgbackrest-recovery-source.conf missing on restart mid-replay (marker bailed without checking recovery.signal)"
+    fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+
+  # The real proof: recovery must be able to actually finish now that it
+  # can still reach the archive, not just have the conf file present.
+  if ! wait_for_promoted "$rest_name"; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "did not promote after restart mid-replay"
+    fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+
+  local missing_file_count
+  missing_file_count=$(docker logs "$rest_name" 2>&1 | grep -c "unable to open missing file.*pgbackrest-recovery-source.conf" || true)
+  if [ "${missing_file_count:-0}" -gt 0 ]; then
+    ko t_recovery_conf_persists_across_restart_mid_replay "logs show missing-file errors despite eventual promote (count=$missing_file_count)"
+    docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
+    return
+  fi
+
+  ok t_recovery_conf_persists_across_restart_mid_replay
+  note "recovery conf re-rendered on mid-replay restart; recovery completed and promoted"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
 # ----- learnings from test-postgres-pitr (railway-side e2e harness) ----------
 #
 # These mirror flows from ../test-postgres-pitr/e2e/run-test.ts at the image
@@ -3627,6 +3813,7 @@ ALL_TESTS=(
   t_restore_then_wipe_volume_redoes_restore
   t_restored_service_can_enable_archive_after_promote
   t_restored_marker_persists_across_restarts
+  t_recovery_conf_persists_across_restart_mid_replay
   # learnings from test-postgres-pitr (image-level mirrors of the railway
   # mutation-driven e2e flows)
   t_pitr_target_xid_routes_xid_through_stack
