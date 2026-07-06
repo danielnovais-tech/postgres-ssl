@@ -242,6 +242,23 @@ wait_for_promoted() {
   return 1
 }
 
+# Poll `docker logs` for a pattern rather than checking once. Guards against
+# a real (if narrow) race: a container can flip to State.Status=exited a
+# beat before the docker log driver has drained its last buffered stdout,
+# so a single grep taken right after detecting "exited" can miss a line
+# that's actually there — a moment later fail_dump's own `docker logs` call
+# on the same container sees it fine. Tests that assert on a log message
+# following an expected-exit should use this instead of a one-shot grep.
+wait_for_log_line() {
+  local container="$1" pattern="$2" timeout="${3:-10}"
+  local deadline=$(($(date +%s) + timeout))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker logs "$container" 2>&1 | grep -q -- "$pattern" && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
 cleanup_test_resources() {
   docker rm -f $(docker ps -aq --filter "label=postgres-ssl-e2e=1") 2>/dev/null >/dev/null || true
   for v in $(docker volume ls -q --filter "label=postgres-ssl-e2e=1" 2>/dev/null); do
@@ -923,7 +940,7 @@ t_empty_volume_restore_refuses_when_no_backup() {
     return
   fi
 
-  if ! docker logs "$name" 2>&1 | grep -q "restore from source bucket failed"; then
+  if ! wait_for_log_line "$name" "restore from source bucket failed"; then
     ko t_empty_volume_restore_refuses_when_no_backup "expected 'restore from source bucket failed' in logs"
     fail_dump t_empty_volume_restore_refuses_when_no_backup "$name"
     return
@@ -2213,7 +2230,7 @@ t_pitr_target_before_retention_window_refuses() {
     ko t_pitr_target_before_retention_window_refuses "wrapper exited 0; expected non-zero refusal"
     return
   fi
-  if ! docker logs "$rest_name" 2>&1 | grep -q "unable to find backup set"; then
+  if ! wait_for_log_line "$rest_name" "unable to find backup set"; then
     ko t_pitr_target_before_retention_window_refuses "expected 'unable to find backup set' from pgbackrest; logs:"
     fail_dump t_pitr_target_before_retention_window_refuses "$rest_name"
     return
@@ -2335,7 +2352,7 @@ t_empty_volume_restore_refuses_on_bad_creds() {
     ko t_empty_volume_restore_refuses_on_bad_creds "wrapper exited 0; expected non-zero refusal"
     return
   fi
-  if ! docker logs "$rest_name" 2>&1 | grep -q "restore from source bucket failed"; then
+  if ! wait_for_log_line "$rest_name" "restore from source bucket failed"; then
     ko t_empty_volume_restore_refuses_on_bad_creds "expected 'restore from source bucket failed' in logs"
     fail_dump t_empty_volume_restore_refuses_on_bad_creds "$rest_name"
     return
