@@ -2,7 +2,7 @@ name: Build and Push PostgreSQL Images
 
 on:
   schedule:
-    - cron: "0 0 * * 1"  # Every Monday at midnight UTC
+    - cron: "0 0 * * *"  # Daily at midnight UTC
   workflow_dispatch:
   push:
     branches:
