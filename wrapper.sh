@@ -1042,6 +1042,9 @@ fork_collation_refresh() {
 
     local tmpfile
     tmpfile=$(mktemp /tmp/collation-refresh.XXXXXX.sql)
+    # mktemp creates 0600 root-owned files; psql runs as postgres via gosu and
+    # cannot read it ("Permission denied"), silently skipping the refresh.
+    chmod 644 "$tmpfile"
     cat > "$tmpfile" << 'ENDSQL'
 DO $body$
 DECLARE
