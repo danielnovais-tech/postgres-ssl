@@ -298,6 +298,19 @@ validate_wal_archive_bucket() {
 }
 validate_wal_archive_bucket
 
+# Environment pinning: on platforms that clone env vars into ephemeral
+# preview environments (Railway PR envs), every clone would archive its
+# own cluster into the SAME bucket — 26 junk repos appeared in 8 days of
+# PR traffic before this guard. When WAL_ARCHIVE_ONLY_ENV is set, only
+# the matching RAILWAY_ENVIRONMENT_NAME keeps archiving; everyone else
+# runs as plain non-archiving Postgres.
+if [ -n "${WAL_ARCHIVE_ONLY_ENV:-}" ] && [ -n "${WAL_ARCHIVE_BUCKET:-}" ] \
+  && [ "${WAL_ARCHIVE_ONLY_ENV}" != "${RAILWAY_ENVIRONMENT_NAME:-}" ]; then
+  echo "pgbackrest: WAL_ARCHIVE_ONLY_ENV=${WAL_ARCHIVE_ONLY_ENV} != env ${RAILWAY_ENVIRONMENT_NAME:-<unset>}; archiving disabled for this clone"
+  unset WAL_ARCHIVE_BUCKET WAL_ARCHIVE_KEY WAL_ARCHIVE_SECRET
+  unset WAL_ARCHIVE_REGION WAL_ARCHIVE_ENDPOINT
+fi
+
 # Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
