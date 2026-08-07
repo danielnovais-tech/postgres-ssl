@@ -321,6 +321,64 @@ t_vanilla_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+# Regression test for fork_collation_refresh's mktemp/chown ordering.
+# mktemp runs as root inside the un-gosu'd subshell and defaults to mode
+# 0600, so unless the wrapper hands ownership to postgres before psql (which
+# drops to that user) tries to read the SQL body, every boot on PG15+ logs
+# "collation-refresh: psql: error: ...: Permission denied" and the
+# ALTER DATABASE ... REFRESH COLLATION VERSION loop silently never runs.
+t_collation_refresh_no_permission_error() {
+  local name=t-collation-refresh-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_collation_refresh_no_permission_error "postgres did not start"; fail_dump t_collation_refresh_no_permission_error "$name"; return; }
+
+  local pg_major
+  pg_major=$(docker exec "$name" cat /var/lib/postgresql/data/PG_VERSION 2>/dev/null || echo 0)
+  if [ "${pg_major:-0}" -lt 15 ] 2>/dev/null; then
+    ok t_collation_refresh_no_permission_error
+    docker rm -f "$name" >/dev/null
+    docker volume rm "$vol" >/dev/null
+    return
+  fi
+
+  # fork_collation_refresh runs in the background after pg_isready succeeds;
+  # give it a few seconds to create, chown, write, and consume the tmpfile.
+  sleep 5
+
+  if docker logs "$name" 2>&1 | grep -qE "collation-refresh:.*Permission denied"; then
+    ko t_collation_refresh_no_permission_error "collation-refresh logged Permission denied"
+    fail_dump t_collation_refresh_no_permission_error "$name"
+    return
+  fi
+
+  # The tmpfile itself is removed after use, but its ownership at creation
+  # time is what matters — confirm postgres can create+read a file in /tmp
+  # the same way the wrapper's tmpfile is handled (root-created, chowned to
+  # postgres, then read by the postgres user via gosu).
+  if ! docker exec "$name" bash -c '
+    set -e
+    f=$(mktemp /tmp/collation-refresh-test.XXXXXX.sql)
+    chown postgres:postgres "$f"
+    echo "select 1;" > "$f"
+    gosu postgres test -r "$f"
+    rm -f "$f"
+  '; then
+    ko t_collation_refresh_no_permission_error "postgres user could not read chowned tmpfile"
+    fail_dump t_collation_refresh_no_permission_error "$name"
+    return
+  fi
+
+  ok t_collation_refresh_no_permission_error
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_invalid_bucket_skips_archive() {
   # Sets WAL_ARCHIVE_BUCKET to junk shapes the upstream resolver might leak
   # (unresolved Railway template ref + bucket-id UUID). The image guard must
@@ -3810,6 +3868,7 @@ t_invalid_bucket_sentinel_cleared_on_disable() {
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_collation_refresh_no_permission_error
   t_invalid_bucket_skips_archive
   t_archiving_boot
   t_alter_system_survives_restart
